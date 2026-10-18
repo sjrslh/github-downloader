@@ -19,7 +19,9 @@ namespace GitHubDownloader
             {
                 string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "GitHub下载器");
                 Directory.CreateDirectory(dir);
-                File.AppendAllText(Path.Combine(dir, "app.log"),
+                string logFile = Path.Combine(dir, "app.log");
+                try { if (File.Exists(logFile) && new FileInfo(logFile).Length > 256 * 1024) File.Delete(logFile); } catch { }
+                File.AppendAllText(logFile,
                     DateTime.Now.ToString("HH:mm:ss.fff") + " " + line + Environment.NewLine, Encoding.UTF8);
             }
             catch { }
@@ -39,6 +41,10 @@ namespace GitHubDownloader
         public static readonly Color CloseHover = Color.FromArgb(232, 17, 35);
 
         public static float Scale = 1f;
+        public static string StartUrl;
+        public static string StartOut;
+        public static bool AutoStart;
+        public static bool AutoExit;
 
         public static int S(int value)
         {
@@ -71,8 +77,16 @@ namespace GitHubDownloader
         private static extern bool ShowWindow(IntPtr hWnd, int command);
 
         [STAThread]
-        public static void Main()
+        public static void Main(string[] args)
         {
+            for (int i = 0; i < args.Length; i++)
+            {
+                string a = args[i].ToLowerInvariant();
+                if (a == "--url" && i + 1 < args.Length) StartUrl = args[++i];
+                else if (a == "--out" && i + 1 < args.Length) StartOut = args[++i];
+                else if (a == "--auto") AutoStart = true;
+                else if (a == "--exit") AutoExit = true;
+            }
             try { SetProcessDpiAwarenessContext(new IntPtr(-4)); } catch { }
             try
             {
@@ -98,6 +112,14 @@ namespace GitHubDownloader
             }
 
             CloseStaleWindows();
+            AppDomain.CurrentDomain.UnhandledException += delegate(object s, UnhandledExceptionEventArgs e)
+            {
+                try { App.LogLine("fatal " + e.ExceptionObject); } catch { }
+            };
+            Application.ThreadException += delegate(object s, System.Threading.ThreadExceptionEventArgs e)
+            {
+                try { App.LogLine("ui " + e.Exception); } catch { }
+            };
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
             Application.Run(new MainForm());
@@ -117,10 +139,13 @@ namespace GitHubDownloader
         private static void CloseStaleWindows()
         {
             uint self = (uint)Process.GetCurrentProcess().Id;
-            foreach (var other in Process.GetProcessesByName("GitHub下载器"))
+            foreach (string name in new string[] { "GitHub下载器", "GitHubDownloader" })
             {
-                if ((uint)other.Id == self) continue;
-                try { other.Kill(); } catch { }
+                foreach (var other in Process.GetProcessesByName(name))
+                {
+                    if ((uint)other.Id == self) continue;
+                    try { other.Kill(); } catch { }
+                }
             }
             EnumWindows(delegate(IntPtr hWnd, IntPtr lParam)
             {
@@ -137,6 +162,57 @@ namespace GitHubDownloader
 
         [DllImport("user32.dll")]
         private static extern bool IsWindowVisible(IntPtr hWnd);
+    }
+
+    internal static class Settings
+    {
+        private static readonly string FilePath = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "GitHub下载器", "settings.ini");
+
+        public static string DownloadDir;
+        public static bool ReadClipboard;
+        public static bool Exists;
+
+        static Settings()
+        {
+            DownloadDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads", "GitHub");
+            ReadClipboard = true;
+            try
+            {
+                string dir = Path.GetDirectoryName(FilePath);
+                if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
+            }
+            catch { }
+            try
+            {
+                if (File.Exists(FilePath))
+                {
+                    Exists = true;
+                    foreach (string line in File.ReadAllLines(FilePath, Encoding.UTF8))
+                    {
+                        int eq = line.IndexOf('=');
+                        if (eq <= 0) continue;
+                        string key = line.Substring(0, eq).Trim();
+                        string value = line.Substring(eq + 1).Trim();
+                        if (key == "downloadDir" && value.Length > 0) DownloadDir = value;
+                        else if (key == "readClipboard") ReadClipboard = value != "0";
+                    }
+                }
+            }
+            catch { }
+        }
+
+        public static void Save()
+        {
+            try
+            {
+                string text = "downloadDir=" + DownloadDir + Environment.NewLine +
+                              "readClipboard=" + (ReadClipboard ? "1" : "0") + Environment.NewLine;
+                File.WriteAllText(FilePath, text, new UTF8Encoding(false));
+                Exists = true;
+            }
+            catch { }
+        }
     }
 
     internal class RoundPanel : Panel
@@ -209,7 +285,15 @@ namespace GitHubDownloader
         protected override void OnMouseEnter(EventArgs e) { hover = true; Invalidate(); base.OnMouseEnter(e); }
         protected override void OnMouseLeave(EventArgs e) { hover = false; pressed = false; Invalidate(); base.OnMouseLeave(e); }
         protected override void OnMouseDown(MouseEventArgs e) { pressed = true; Focus(); Invalidate(); base.OnMouseDown(e); }
-        protected override void OnMouseUp(MouseEventArgs e) { pressed = false; Invalidate(); base.OnMouseUp(e); }
+        protected override void OnMouseUp(MouseEventArgs e)
+        {
+            bool wasPressed = pressed;
+            pressed = false;
+            Invalidate();
+            base.OnMouseUp(e);
+            if (wasPressed && Enabled && e.Button == MouseButtons.Left && ClientRectangle.Contains(e.Location))
+                OnClick(EventArgs.Empty);
+        }
         protected override void OnEnabledChanged(EventArgs e) { Invalidate(); base.OnEnabledChanged(e); }
         protected override void OnGotFocus(EventArgs e) { Invalidate(); base.OnGotFocus(e); }
         protected override void OnLostFocus(EventArgs e) { Invalidate(); base.OnLostFocus(e); }
@@ -331,6 +415,25 @@ namespace GitHubDownloader
         protected override void OnMouseEnter(EventArgs e) { Hover = true; Invalidate(); base.OnMouseEnter(e); }
         protected override void OnMouseLeave(EventArgs e) { Hover = false; Invalidate(); base.OnMouseLeave(e); }
 
+        private DateTime lastClickUtc = DateTime.MinValue;
+
+        protected override void OnMouseUp(MouseEventArgs e)
+        {
+            base.OnMouseUp(e);
+            if (!Enabled || e.Button != MouseButtons.Left || !ClientRectangle.Contains(e.Location)) return;
+            DateTime now = DateTime.UtcNow;
+            if ((now - lastClickUtc).TotalMilliseconds < 450)
+            {
+                lastClickUtc = DateTime.MinValue;
+                OnDoubleClick(EventArgs.Empty);
+            }
+            else
+            {
+                lastClickUtc = now;
+                OnClick(EventArgs.Empty);
+            }
+        }
+
         protected override void OnPaint(PaintEventArgs e)
         {
             e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
@@ -401,6 +504,172 @@ namespace GitHubDownloader
         }
     }
 
+
+    internal sealed class SettingsDialog : Form
+    {
+        [DllImport("dwmapi.dll")]
+        private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attribute, ref int value, int size);
+        [DllImport("user32.dll")]
+        private static extern bool ReleaseCapture();
+        [DllImport("user32.dll")]
+        private static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
+
+        public string DownloadDir;
+        public bool ReadClipboard;
+        private readonly bool firstRun;
+        private readonly RoundInput dirInput;
+        private readonly CheckBox clipCheck;
+
+        public SettingsDialog(bool firstRun)
+        {
+            this.firstRun = firstRun;
+
+            FormBorderStyle = FormBorderStyle.None;
+            Text = firstRun ? "第一次使用" : "设置";
+            BackColor = App.Bg;
+            ForeColor = App.Text;
+            Font = new Font("Microsoft YaHei UI", 9.5f);
+            ClientSize = new Size(App.S(560), App.S(312));
+            StartPosition = FormStartPosition.CenterParent;
+            ShowInTaskbar = false;
+            AutoScaleMode = AutoScaleMode.None;
+            DoubleBuffered = true;
+            KeyPreview = true;
+
+            var title = new Label();
+            title.Text = firstRun ? "第一次使用" : "设置";
+            title.Font = new Font("Microsoft YaHei UI", 14f, FontStyle.Bold);
+            title.ForeColor = App.Text;
+            title.BackColor = App.Bg;
+            title.SetBounds(App.S(24), App.S(18), App.S(320), App.S(30));
+            title.MouseDown += DragWindow;
+            Controls.Add(title);
+
+            var close = new PillButton();
+            close.Text = "×";
+            close.Danger = true;
+            close.Font = new Font("Segoe UI", 12f, FontStyle.Regular);
+            close.SetBounds(ClientSize.Width - App.S(48), App.S(20), App.S(28), App.S(28));
+            close.Click += delegate { DialogResult = DialogResult.Cancel; Close(); };
+            Controls.Add(close);
+
+            var hint = new Label();
+            hint.Text = firstRun
+                ? "先选一个默认下载目录，之后随时点右上角 ⚙ 改。"
+                : "改完点保存，下次启动会用这里的设置。";
+            hint.ForeColor = App.Muted;
+            hint.BackColor = App.Bg;
+            hint.SetBounds(App.S(24), App.S(52), ClientSize.Width - App.S(48), App.S(20));
+            hint.MouseDown += DragWindow;
+            Controls.Add(hint);
+
+            var dirLabel = new Label();
+            dirLabel.Text = "下载目录";
+            dirLabel.ForeColor = App.Muted;
+            dirLabel.BackColor = App.Bg;
+            dirLabel.SetBounds(App.S(24), App.S(94), App.S(72), App.S(24));
+            Controls.Add(dirLabel);
+
+            dirInput = new RoundInput();
+            dirInput.SetBounds(App.S(100), App.S(88), ClientSize.Width - App.S(220), App.S(36));
+            dirInput.Box.Font = new Font("Consolas", 9.5f);
+            Controls.Add(dirInput);
+
+            var browse = new PillButton();
+            browse.Text = "浏览";
+            browse.SetBounds(ClientSize.Width - App.S(112), App.S(88), App.S(88), App.S(36));
+            browse.Click += delegate
+            {
+                using (var dialog = new FolderBrowserDialog())
+                {
+                    dialog.Description = "选择默认下载目录";
+                    dialog.SelectedPath = dirInput.Box.Text;
+                    if (dialog.ShowDialog(this) == DialogResult.OK) dirInput.Box.Text = dialog.SelectedPath;
+                }
+            };
+            Controls.Add(browse);
+
+            clipCheck = new CheckBox();
+            clipCheck.Text = "启动时从剪贴板读取链接";
+            clipCheck.ForeColor = App.Text;
+            clipCheck.BackColor = App.Bg;
+            clipCheck.FlatStyle = FlatStyle.Flat;
+            clipCheck.SetBounds(App.S(24), App.S(146), App.S(300), App.S(26));
+            Controls.Add(clipCheck);
+
+            var save = new PillButton();
+            save.Primary = true;
+            save.Text = firstRun ? "开始使用" : "保存";
+            save.SetBounds(App.S(24), ClientSize.Height - App.S(64), App.S(140), App.S(44));
+            save.Click += delegate { SaveSettings(); };
+            Controls.Add(save);
+
+            var cancel = new PillButton();
+            cancel.Text = firstRun ? "用默认目录" : "取消";
+            cancel.SetBounds(App.S(176), ClientSize.Height - App.S(64), App.S(140), App.S(44));
+            cancel.Click += delegate { DialogResult = DialogResult.Cancel; Close(); };
+            Controls.Add(cancel);
+
+
+            Shown += delegate
+            {
+                dirInput.Box.Text = DownloadDir;
+                clipCheck.Checked = ReadClipboard;
+                dirInput.Box.Focus();
+                dirInput.Box.SelectionStart = dirInput.Box.TextLength;
+            };
+        }
+
+        protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
+        {
+            if (keyData == Keys.Enter) { SaveSettings(); return true; }
+            if (keyData == Keys.Escape) { DialogResult = DialogResult.Cancel; Close(); return true; }
+            return base.ProcessCmdKey(ref msg, keyData);
+        }
+
+        private void DragWindow(object sender, MouseEventArgs e)
+        {
+            if (e.Button != MouseButtons.Left) return;
+            ReleaseCapture();
+            SendMessage(Handle, 0x00A1, (IntPtr)2, IntPtr.Zero);
+        }
+
+        private void SaveSettings()
+        {
+            string dir = dirInput.Box.Text.Trim().Trim('"');
+            if (dir.Length == 0)
+            {
+                MessageBox.Show(this, "下载目录不能为空。", "设置", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            DownloadDir = dir;
+            ReadClipboard = clipCheck.Checked;
+            DialogResult = DialogResult.OK;
+            Close();
+        }
+
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            try
+            {
+                int dark = 1;
+                if (DwmSetWindowAttribute(Handle, 20, ref dark, sizeof(int)) != 0)
+                    DwmSetWindowAttribute(Handle, 19, ref dark, sizeof(int));
+                int round = 2;
+                DwmSetWindowAttribute(Handle, 33, ref round, sizeof(int));
+            }
+            catch { }
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            base.OnPaint(e);
+            using (var pen = new Pen(App.Line))
+                e.Graphics.DrawRectangle(pen, 0, 0, Width - 1, Height - 1);
+        }
+    }
+
     internal sealed class MainForm : Form
     {
         private const int WM_NCHITTEST = 0x0084;
@@ -454,7 +723,7 @@ namespace GitHubDownloader
 
             FormBorderStyle = FormBorderStyle.None;
             MaximizeBox = false;
-            Text = "GitHub 下载器 · v1.4";
+            Text = "GitHub 下载器 · v1.5";
             BackColor = App.Bg;
             ForeColor = App.Text;
             Font = new Font("Microsoft YaHei UI", 9.5f);
@@ -479,6 +748,26 @@ namespace GitHubDownloader
 
             Shown += delegate
             {
+                if (!Settings.Exists && string.IsNullOrEmpty(App.StartOut))
+                {
+                    using (var dialog = new SettingsDialog(true))
+                    {
+                        dialog.DownloadDir = Settings.DownloadDir;
+                        dialog.ReadClipboard = Settings.ReadClipboard;
+                        if (dialog.ShowDialog(this) == DialogResult.OK)
+                            ApplySettings(dialog.DownloadDir, dialog.ReadClipboard);
+                        else
+                        {
+                            Settings.DownloadDir = dialog.DownloadDir;
+                            Settings.ReadClipboard = dialog.ReadClipboard;
+                            Settings.Save();
+                            outInput.Box.Text = Settings.DownloadDir;
+                        }
+                    }
+                }
+
+                if (App.AutoStart) { StartDownload(); return; }
+
                 string owner, repo, tag;
                 string text = urlInput.Box.Text.Trim();
                 if (text.Length > 0 && TryParseRepo(text, out owner, out repo, out tag))
@@ -665,7 +954,7 @@ namespace GitHubDownloader
             headerPanel.Controls.Add(title);
 
             var version = new Label();
-            version.Text = "v1.4";
+            version.Text = "v1.5";
             version.Font = new Font("Consolas", 8.5f);
             version.ForeColor = App.Accent;
             version.BackColor = App.Bg;
@@ -702,6 +991,14 @@ namespace GitHubDownloader
                     TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
             };
             headerPanel.Controls.Add(envLabel);
+
+            var gear = new PillButton();
+            gear.Text = "⚙";
+            gear.Font = new Font("Segoe UI Symbol", 11f);
+            gear.SetBounds(ClientSize.Width - App.S(120), App.S(22), App.S(28), App.S(28));
+            gear.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+            gear.Click += delegate { OpenSettings(); };
+            headerPanel.Controls.Add(gear);
 
             var close = new PillButton();
             close.Text = "×";
@@ -775,6 +1072,11 @@ namespace GitHubDownloader
             assetPanel.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom;
             assetPanel.AutoScroll = true;
             assetPanel.BackColor = App.Card;
+            assetPanel.Layout += delegate
+            {
+                int width = assetPanel.ClientSize.Width - App.S(22);
+                foreach (var r in rows) if (r.Width != width) r.Width = width;
+            };
             assetCard.Controls.Add(assetPanel);
 
             var outCard = new Card();
@@ -807,7 +1109,12 @@ namespace GitHubDownloader
                 {
                     dialog.Description = "选择下载保存位置";
                     dialog.SelectedPath = outInput.Box.Text;
-                    if (dialog.ShowDialog(this) == DialogResult.OK) outInput.Box.Text = dialog.SelectedPath;
+                    if (dialog.ShowDialog(this) == DialogResult.OK)
+                    {
+                        outInput.Box.Text = dialog.SelectedPath;
+                        Settings.DownloadDir = dialog.SelectedPath;
+                        Settings.Save();
+                    }
                 }
             };
             outCard.Controls.Add(browseButton);
@@ -871,9 +1178,18 @@ namespace GitHubDownloader
             statusLabel.Anchor = AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
             Controls.Add(statusLabel);
 
-            string clip = FirstLine(SafeClipboard());
+            string clip = Settings.ReadClipboard ? FirstLine(SafeClipboard()) : null;
             if (LooksLikeTarget(clip)) urlInput.Box.Text = clip;
-            outInput.Box.Text = defaultOut;
+            if (!string.IsNullOrEmpty(App.StartUrl)) urlInput.Box.Text = App.StartUrl;
+            if (!string.IsNullOrEmpty(App.StartOut))
+            {
+                outInput.Box.Text = App.StartOut;
+                Settings.DownloadDir = App.StartOut;
+            }
+            else
+            {
+                outInput.Box.Text = Settings.DownloadDir;
+            }
             UpdateDownloadState();
         }
 
@@ -889,6 +1205,26 @@ namespace GitHubDownloader
             string os = Environment.OSVersion.Version.Build >= 22000 ? "Windows 11" : "Windows 10";
             string arch = Environment.Is64BitOperatingSystem ? "x64" : "x86";
             return os + " · " + arch;
+        }
+
+        private void OpenSettings()
+        {
+            using (var dialog = new SettingsDialog(false))
+            {
+                dialog.DownloadDir = Settings.DownloadDir;
+                dialog.ReadClipboard = Settings.ReadClipboard;
+                if (dialog.ShowDialog(this) == DialogResult.OK)
+                    ApplySettings(dialog.DownloadDir, dialog.ReadClipboard);
+            }
+        }
+
+        private void ApplySettings(string dir, bool readClipboard)
+        {
+            Settings.DownloadDir = dir;
+            Settings.ReadClipboard = readClipboard;
+            Settings.Save();
+            outInput.Box.Text = dir;
+            SetStatus("设置已保存。", App.Ok);
         }
 
         private void SetStatus(string text, Color color)
@@ -972,6 +1308,8 @@ namespace GitHubDownloader
                         if (process.ExitCode != 0)
                         {
                             string detail = string.IsNullOrWhiteSpace(errText) ? ("退出码 " + process.ExitCode) : errText.Trim();
+                                if (detail.Contains("403") || detail.IndexOf("rate limit", StringComparison.OrdinalIgnoreCase) >= 0)
+                                    detail = "GitHub API 限流了（每小时 60 次），等一会儿再试。";
                             if (detail.Length > 300) detail = detail.Substring(0, 300);
                             data = null;
                             error = "读取失败：" + detail;
@@ -1164,9 +1502,9 @@ namespace GitHubDownloader
             if (running != null) return;
 
             string target = urlInput.Box.Text.Trim();
-            string outDir = outInput.Box.Text.Trim();
+            string outDir = outInput.Box.Text.Trim().Replace("\"", "");
             if (target.Length == 0) { SetStatus("先贴一个链接。", App.Err); return; }
-            if (outDir.Length == 0) outDir = defaultOut;
+            if (outDir.Length == 0) outDir = Settings.DownloadDir;
 
             if (!File.Exists(scriptPath))
             {
@@ -1179,6 +1517,7 @@ namespace GitHubDownloader
             catch (Exception ex) { SetStatus("创建目录失败：" + ex.Message, App.Err); return; }
 
             logBox.Clear();
+            App.LogLine("download " + target + " -> " + outDir);
             AppendLog("目标：" + target);
             AppendLog("保存到：" + outDir);
             AppendLog("");
@@ -1231,6 +1570,7 @@ namespace GitHubDownloader
 
         private void OnFinished(int exitCode)
         {
+            App.LogLine("finish code=" + exitCode);
             running = null;
             SetRunning(false);
             if (exitCode == 0)
@@ -1244,6 +1584,13 @@ namespace GitHubDownloader
                 SetStatus("结束了，退出码 " + exitCode + "，看日志。", App.Err);
                 AppendLog("");
                 AppendLog("=== 退出码 " + exitCode + " ===");
+            }
+            if (App.AutoExit)
+            {
+                System.Windows.Forms.Timer closer = new System.Windows.Forms.Timer();
+                closer.Interval = 800;
+                closer.Tick += delegate { closer.Stop(); Close(); };
+                closer.Start();
             }
         }
 
