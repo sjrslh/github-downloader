@@ -1,0 +1,14 @@
+# build output
+dist/
+
+# old launcher kept for reference
+legacy/
+
+# logs
+*.log
+
+# local caches
+.vs/
+obj/
+bin/
+__pycache__/
