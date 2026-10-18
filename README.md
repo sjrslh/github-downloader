@@ -69,7 +69,7 @@ powershell -ExecutionPolicy Bypass -File build.ps1
 
 ## 图标
 
-图标由 **FLUX.1-schnell**（Hugging Face 免费 Space）生成，再用 `make-icon.py`（Pillow）转成多尺寸 ICO 嵌进 exe。
+图标由 **FLUX.1-schnell**（Hugging Face 免费 Space）生成：`make-icon.py` 先把 WebP 转成 PNG，`make-ico.py` 再拼出多尺寸 ICO（16–128 用 BMP 条目、256 用 PNG——Explorer 只认 BMP 条目的小图标，纯 PNG 的 ICO 在桌面上会退回旧图标或通用图标）。
 
 ## 说明
 
