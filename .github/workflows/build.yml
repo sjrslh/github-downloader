@@ -1,4 +1,4 @@
-# verified: workflow scope push test
+# verified: credential chain fixed
 name: build
 
 on:
