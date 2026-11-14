@@ -1,3 +1,4 @@
+# verified: workflow scope push test
 name: build
 
 on:
