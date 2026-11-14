@@ -15,6 +15,7 @@ Windows 桌面版 GitHub 下载工具：粘贴链接 → 自动解析 Release �
 - **默认存到系统「下载」**：和浏览器下载的位置一致（走 `SHGetKnownFolderPath`，下载夹被重定向到 D 盘/OneDrive 也能认对）；想换目录点右上角 ⚙ 或「浏览」，设置写在 `%LOCALAPPDATA%\GitHub下载器\settings.ini`
 - **可选 Token**：在 ⚙ 里填一个 GitHub Personal Access Token，API 限额从 60 次/小时提到 5000 次/小时（只存在本地）
 - **单实例 + 纯 popup 窗口**：不会重复开窗，也不会冒出系统标题栏
+- **系统托盘常驻**：最小化后在托盘里，双击或右键「显示窗口」就能叫回来；右键菜单里也有「退出」
 - **命令行参数**：`--url` / `--out` / `--auto` / `--exit`，方便脚本化调用
 
 ## 下载
@@ -31,6 +32,7 @@ Windows 桌面版 GitHub 下载工具：粘贴链接 → 自动解析 Release �
 3. 粘贴链接（或直接把链接拖进窗口），点「解析附件」
 4. 列表里推荐项已经自动勾好；需要多下几个就继续点其他行勾选
 5. 点「开始下载」，进度条和状态栏实时更新；完成后点「打开文件夹」
+6. 最小化后程序会收在系统托盘，双击托盘图标即可恢复窗口
 
 ![第一次使用](docs/first-run.png)
 
@@ -102,7 +104,7 @@ GitHubDownloader.exe --url "https://github.com/owner/repo/releases/download/v1.0
 │  └─ icon-src.webp       # 生成原稿
 ├─ tests/
 │  └─ mock-release-server.py   # 本地 mock Release API，用来回归解析/下载/进度
-├─ docs/
+├─ docs/                    # README 用的三张截图（主界面 / 首次使用 / 设置）
 ├─ build.ps1              # 编译脚本
 ├─ make-icon.py           # WebP → 去白角 → PNG
 └─ make-ico.py            # PNG → 多尺寸 ICO
