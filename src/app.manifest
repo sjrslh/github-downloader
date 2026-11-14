@@ -3,8 +3,11 @@
   <assemblyIdentity version="1.0.0.0" name="GitHubDownloader.app" />
   <application xmlns="urn:schemas-microsoft-com:asm.v3">
     <windowsSettings>
-      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true</dpiAware>
-      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">system</dpiAwareness>
+      <!-- PerMonitorV2：进程自己拿真实物理像素算布局。
+           以前是 system，Windows 会把窗口再放大一次，导致 150% 下窗口
+           比设计的 900x792 大出 50%，底部状态栏直接被推出屏幕。 -->
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2</dpiAwareness>
       <longPathAware xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</longPathAware>
     </windowsSettings>
   </application>

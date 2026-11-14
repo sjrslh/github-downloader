@@ -4,9 +4,11 @@ using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.IO;
+using System.Net;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
+using System.Web.Script.Serialization;
 using System.Windows.Forms;
 
 namespace GitHubDownloader
@@ -40,6 +42,9 @@ namespace GitHubDownloader
         public static readonly Color LogBg = Color.FromArgb(14, 17, 24);
         public static readonly Color CloseHover = Color.FromArgb(232, 17, 35);
 
+        /// <summary>版本号只在这里改，标题和界面都引用它。</summary>
+        public static readonly string Version = "1.6";
+
         public static float Scale = 1f;
         public static string StartUrl;
         public static string StartOut;
@@ -51,11 +56,61 @@ namespace GitHubDownloader
             return (int)Math.Round(value * Scale);
         }
 
+        [DllImport("shell32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern int SHGetKnownFolderPath(ref Guid rfid, uint flags, IntPtr token, out IntPtr path);
+
+        private static readonly Guid FolderIdDownloads = new Guid("374DE290-123F-4565-9164-39C4925E467B");
+
+        /// <summary>
+        /// 系统的「下载」文件夹。不能硬拼 %USERPROFILE%\Downloads —— 用户可能把它
+        /// 重定向到 D 盘或 OneDrive，只有问 Shell 才是准的。
+        /// </summary>
+        public static string GetDownloadsFolder()
+        {
+            try
+            {
+                Guid id = FolderIdDownloads;
+                IntPtr ptr;
+                if (SHGetKnownFolderPath(ref id, 0, IntPtr.Zero, out ptr) == 0 && ptr != IntPtr.Zero)
+                {
+                    string path = Marshal.PtrToStringUni(ptr);
+                    Marshal.FreeCoTaskMem(ptr);
+                    if (!string.IsNullOrEmpty(path)) return path;
+                }
+            }
+            catch { }
+
+            try
+            {
+                using (var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(
+                    @"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders"))
+                {
+                    if (key != null)
+                    {
+                        object value = key.GetValue("{374DE290-123F-4565-9164-39C4925E467B}");
+                        if (value != null)
+                        {
+                            string path = Environment.ExpandEnvironmentVariables(Convert.ToString(value));
+                            if (!string.IsNullOrEmpty(path)) return path;
+                        }
+                    }
+                }
+            }
+            catch { }
+
+            return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads");
+        }
+
         public static GraphicsPath Round(Rectangle r, int radius)
         {
             var path = new GraphicsPath();
             if (radius <= 0 || r.Width <= 1 || r.Height <= 1) { path.AddRectangle(r); return path; }
-            int d = Math.Min(Math.Min(radius * 2, r.Width), r.Height);
+
+            // 圆角半径不能超过短边的一半：否则左右（上下）两个角的弧会相互重叠，
+            // 那条边会被画成畸形——「胶囊」高度本来就等于两倍圆角时最容易踩到。
+            int maxRadius = Math.Min(r.Width, r.Height) / 2;
+            int rad = Math.Min(radius, maxRadius);
+            int d = rad * 2;
             path.AddArc(r.X, r.Y, d, d, 180, 90);
             path.AddArc(r.Right - d, r.Y, d, d, 270, 90);
             path.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
@@ -87,6 +142,8 @@ namespace GitHubDownloader
                 else if (a == "--auto") AutoStart = true;
                 else if (a == "--exit") AutoExit = true;
             }
+            // .NET Framework 默认 TLS 版本偏旧，遇到只认 TLS1.2 的代理/CDN 会报 SecureChannelFailure
+            try { ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12; } catch { }
             try { SetProcessDpiAwarenessContext(new IntPtr(-4)); } catch { }
             try
             {
@@ -102,11 +159,16 @@ namespace GitHubDownloader
             var mutex = new Mutex(true, "Local\\GitHubDownloader.SingleInstance", out created);
             if (!created)
             {
-                IntPtr existing = FindWindow(null, "GitHub 下载器");
-                if (existing != IntPtr.Zero)
+                // 窗口标题是「GitHub 下载器 · v1.5」，用 FindWindow 精确匹配根本找不到，
+                // 结果是第二次双击毫无反应。改成直接找同名进程的主窗口。
+                foreach (var other in Process.GetProcessesByName("GitHubDownloader"))
                 {
-                    ShowWindow(existing, 9);
-                    SetForegroundWindow(existing);
+                    if (other.Id == Process.GetCurrentProcess().Id) continue;
+                    IntPtr hwnd = other.MainWindowHandle;
+                    if (hwnd == IntPtr.Zero) continue;
+                    ShowWindow(hwnd, 9);          // SW_RESTORE
+                    SetForegroundWindow(hwnd);
+                    break;
                 }
                 return;
             }
@@ -162,6 +224,23 @@ namespace GitHubDownloader
 
         [DllImport("user32.dll")]
         private static extern bool IsWindowVisible(IntPtr hWnd);
+
+        [DllImport("uxtheme.dll", CharSet = CharSet.Unicode)]
+        private static extern int SetWindowTheme(IntPtr hWnd, string subAppName, string subIdList);
+
+        /// <summary>
+        /// 让原生滚动条跟随深色主题。不处理的话，深蓝界面里会插一条刺眼的浅色滚动条。
+        /// Windows 11 / Win10 1809+ 支持 DarkMode_Explorer。
+        /// </summary>
+        public static void ApplyDarkScrollbar(Control control)
+        {
+            try
+            {
+                if (control != null && control.IsHandleCreated)
+                    SetWindowTheme(control.Handle, "DarkMode_Explorer", null);
+            }
+            catch { }
+        }
     }
 
     internal static class Settings
@@ -171,11 +250,15 @@ namespace GitHubDownloader
 
         public static string DownloadDir;
         public static bool ReadClipboard;
+        public static string GitHubToken = "";
         public static bool Exists;
+        /// <summary>旧默认值是「下载\GitHub」，现在用系统「下载」根目录，需要静默迁移一次。</summary>
+        public static bool MigratedLegacyDir;
 
         static Settings()
         {
-            DownloadDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads", "GitHub");
+            string downloads = App.GetDownloadsFolder();
+            DownloadDir = downloads;
             ReadClipboard = true;
             try
             {
@@ -196,6 +279,23 @@ namespace GitHubDownloader
                         string value = line.Substring(eq + 1).Trim();
                         if (key == "downloadDir" && value.Length > 0) DownloadDir = value;
                         else if (key == "readClipboard") ReadClipboard = value != "0";
+                        else if (key == "githubToken") GitHubToken = value;
+                    }
+                }
+            }
+            catch { }
+
+            // settings.ini 里如果还存着旧默认值（...\Downloads\GitHub），迁到系统「下载」根目录
+            try
+            {
+                if (!string.IsNullOrEmpty(DownloadDir))
+                {
+                    string legacy = Path.Combine(downloads, "GitHub");
+                    string cur = DownloadDir.TrimEnd('\\', '/');
+                    if (string.Equals(cur, legacy.TrimEnd('\\', '/'), StringComparison.OrdinalIgnoreCase))
+                    {
+                        DownloadDir = downloads;
+                        MigratedLegacyDir = true;
                     }
                 }
             }
@@ -207,11 +307,167 @@ namespace GitHubDownloader
             try
             {
                 string text = "downloadDir=" + DownloadDir + Environment.NewLine +
-                              "readClipboard=" + (ReadClipboard ? "1" : "0") + Environment.NewLine;
+                              "readClipboard=" + (ReadClipboard ? "1" : "0") + Environment.NewLine +
+                              "githubToken=" + (GitHubToken ?? "") + Environment.NewLine;
                 File.WriteAllText(FilePath, text, new UTF8Encoding(false));
                 Exists = true;
             }
             catch { }
+        }
+    }
+
+    /// <summary>
+    /// 找一台能用的本地代理。国内加速器端口五花八门，很多只开 socks
+    /// （比如 sing-box 的 10808 只认 socks5，不认 HTTP CONNECT），
+    /// 而 .NET 的 HttpWebRequest 根本不支持 socks —— 所以探出来的地址主要给 curl 用。
+    /// </summary>
+    internal static class ProxyFinder
+    {
+        private static string cached;
+        private static bool probed;
+        private static readonly object gate = new object();
+
+        private static readonly int[] CommonPorts = new int[]
+        {
+            10808, 10809, 10810, 1080, 1081, 7890, 7891, 7897, 2080, 20171, 8889, 8118, 8080
+        };
+
+        public static string Find(bool refresh)
+        {
+            lock (gate)
+            {
+                if (!refresh && probed) return cached;
+                probed = true;
+                cached = Probe();
+                App.LogLine("proxy=" + (string.IsNullOrEmpty(cached) ? "(none)" : cached));
+                return cached;
+            }
+        }
+
+        private static string Probe()
+        {
+            var candidates = new List<string>();
+            string sys = ReadSystemProxy();
+            if (!string.IsNullOrEmpty(sys)) candidates.Add("http://" + sys);
+
+            foreach (int port in CommonPorts) candidates.Add("socks5h://127.0.0.1:" + port);
+            foreach (int port in CommonPorts) candidates.Add("http://127.0.0.1:" + port);
+
+            var seen = new HashSet<string>();
+            foreach (string candidate in candidates)
+            {
+                if (!seen.Add(candidate)) continue;
+                if (!PortAlive(candidate)) continue;
+                if (TestProxy(candidate)) return candidate;
+            }
+            return "";
+        }
+
+        private static string ReadSystemProxy()
+        {
+            try
+            {
+                using (var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(
+                    @"Software\Microsoft\Windows\CurrentVersion\Internet Settings"))
+                {
+                    if (key == null) return null;
+                    object enabled = key.GetValue("ProxyEnable");
+                    object server = key.GetValue("ProxyServer");
+                    if (enabled == null || Convert.ToInt32(enabled) != 1 || server == null) return null;
+                    string srv = Convert.ToString(server);
+                    if (srv.IndexOf('=') >= 0)
+                    {
+                        foreach (string part in srv.Split(';'))
+                        {
+                            int eq = part.IndexOf('=');
+                            if (eq > 0 && part.Substring(0, eq).ToLowerInvariant().StartsWith("http"))
+                                return part.Substring(eq + 1).Trim();
+                        }
+                        return null;
+                    }
+                    return srv.Trim();
+                }
+            }
+            catch { return null; }
+        }
+
+        /// <summary>
+        /// 失败时给出可操作的现场信息，而不是一句「没找到代理」。
+        /// 最常见的根因就是 hosts 把 github 指到了本机，而代理又没开。
+        /// </summary>
+        public static string Diagnose()
+        {
+            var sb = new StringBuilder();
+
+            try
+            {
+                string hostsPath = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.System), @"drivers\etc\hosts");
+                if (File.Exists(hostsPath))
+                {
+                    int blocked = 0;
+                    foreach (string raw in File.ReadAllLines(hostsPath))
+                    {
+                        string line = raw.Trim();
+                        if (line.Length == 0 || line[0] == '#') continue;
+                        if (line.IndexOf("github", StringComparison.OrdinalIgnoreCase) >= 0) blocked++;
+                    }
+                    if (blocked > 0)
+                        sb.Append("hosts 里有 ").Append(blocked).Append(" 行 github 记录指向本机（会挡住直连）；");
+                }
+            }
+            catch { }
+
+            string sys = ReadSystemProxy();
+            if (!string.IsNullOrEmpty(sys)) sb.Append("系统代理设为 ").Append(sys).Append("，但连不通；");
+            else sb.Append("系统代理没开；");
+
+            var alive = new List<string>();
+            foreach (int port in CommonPorts)
+            {
+                if (PortAlive("socks5h://127.0.0.1:" + port)) alive.Add(port.ToString());
+            }
+            if (alive.Count > 0) sb.Append("探测到的监听端口：").Append(string.Join("/", alive.ToArray())).Append("（但都连不通 GitHub）；");
+            else sb.Append("常见代理端口（10808/10809/7890 等）都没有服务在听；");
+
+            sb.Append("先确认加速器已启动。");
+            return sb.ToString();
+        }
+
+        private static bool PortAlive(string proxyUrl)
+        {
+            try
+            {
+                var uri = new Uri(proxyUrl.Replace("socks5h://", "http://"));
+                using (var client = new System.Net.Sockets.TcpClient())
+                {
+                    var task = client.ConnectAsync(uri.Host, uri.Port);
+                    if (!task.Wait(150)) return false;
+                    return client.Connected;
+                }
+            }
+            catch { return false; }
+        }
+
+        private static bool TestProxy(string proxyUrl)
+        {
+            try
+            {
+                var psi = new ProcessStartInfo("curl.exe");
+                psi.Arguments = "-s -o NUL -w \"%{http_code}\" --max-time 3 --proxy \"" + proxyUrl +
+                    "\" https://api.github.com/rate_limit";
+                psi.UseShellExecute = false;
+                psi.CreateNoWindow = true;
+                psi.RedirectStandardOutput = true;
+                psi.RedirectStandardError = true;
+                using (var proc = Process.Start(psi))
+                {
+                    string code = proc.StandardOutput.ReadToEnd().Trim();
+                    proc.WaitForExit(4000);
+                    return code == "200";
+                }
+            }
+            catch { return false; }
         }
     }
 
@@ -348,11 +604,162 @@ namespace GitHubDownloader
         }
     }
 
+    /// <summary>
+    /// 日志区用的细滚动条。原生 WinForms 滚动条在深色界面上是一条白色竖条，
+    /// 非常突兀；系统深色主题（DarkMode_Explorer）又暗到几乎看不见。
+    /// 所以自己画：深色轨道 + 灰色圆角滑块。
+    /// </summary>
+    internal class SlimScroll : Control
+    {
+        public Action<int> ScrollTo;
+
+        private int total;
+        private int first;
+        private int visible;
+        private bool hover;
+        private bool dragging;
+        private int dragStartY;
+        private int dragStartFirst;
+
+        public SlimScroll()
+        {
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint |
+                     ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+            BackColor = Color.FromArgb(14, 17, 24);
+            Visible = false;
+        }
+
+        public void Sync(int totalLines, int firstVisible, int visibleLines)
+        {
+            total = totalLines;
+            first = firstVisible;
+            visible = visibleLines;
+
+            bool needed = total > visible && visible > 0;
+            if (Visible != needed) Visible = needed;
+            if (needed) Invalidate();
+        }
+
+        private int ThumbHeight()
+        {
+            if (total <= 0) return Height;
+            double ratio = (double)visible / total;
+            return Math.Max(App.S(24), (int)(Height * ratio));
+        }
+
+        private int ThumbTop()
+        {
+            int travel = Height - ThumbHeight();
+            int maxFirst = Math.Max(1, total - visible);
+            return (int)((double)first / maxFirst * travel);
+        }
+
+        protected override void OnMouseEnter(EventArgs e) { hover = true; Invalidate(); base.OnMouseEnter(e); }
+        protected override void OnMouseLeave(EventArgs e) { hover = false; Invalidate(); base.OnMouseLeave(e); }
+
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            base.OnMouseDown(e);
+            if (e.Button != MouseButtons.Left || ScrollTo == null) return;
+            int top = ThumbTop();
+            if (e.Y >= top && e.Y <= top + ThumbHeight())
+            {
+                dragging = true;
+                dragStartY = e.Y;
+                dragStartFirst = first;
+                Invalidate();
+            }
+            else
+            {
+                // 点轨道：整页跳
+                int target = e.Y < top ? first - visible : first + visible;
+                ScrollTo(Math.Max(0, Math.Min(total - visible, target)));
+            }
+        }
+
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            base.OnMouseMove(e);
+            if (!dragging || ScrollTo == null) return;
+            int travel = Math.Max(1, Height - ThumbHeight());
+            int maxFirst = Math.Max(1, total - visible);
+            int deltaLines = (int)((double)(e.Y - dragStartY) / travel * maxFirst);
+            ScrollTo(Math.Max(0, Math.Min(maxFirst, dragStartFirst + deltaLines)));
+        }
+
+        protected override void OnMouseUp(MouseEventArgs e)
+        {
+            base.OnMouseUp(e);
+            dragging = false;
+            Invalidate();
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            using (var bg = new SolidBrush(Color.FromArgb(14, 17, 24)))
+                e.Graphics.FillRectangle(bg, ClientRectangle);
+
+            if (total <= visible || total <= 0) return;
+
+            int th = ThumbHeight();
+            int tt = ThumbTop();
+            var thumb = new Rectangle(0, tt, Width - 1, th);
+
+            Color fill = dragging ? Color.FromArgb(150, 158, 178)
+                       : hover ? Color.FromArgb(118, 126, 146)
+                       : Color.FromArgb(84, 92, 110);
+            using (var path = App.Round(thumb, Math.Max(2, Width / 2)))
+            using (var b = new SolidBrush(fill))
+                e.Graphics.FillPath(b, path);
+        }
+    }
+
+    /// <summary>输入框右侧的圆形清除按钮，有内容时才显示。</summary>
+    internal class ClearDot : Control
+    {
+        public Color Surface = Color.FromArgb(17, 21, 29);
+        private bool hover;
+
+        public ClearDot()
+        {
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint |
+                     ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+            BackColor = Surface;
+            Cursor = Cursors.Hand;
+            TabStop = false;
+        }
+
+        protected override void OnMouseEnter(EventArgs e) { hover = true; Invalidate(); base.OnMouseEnter(e); }
+        protected override void OnMouseLeave(EventArgs e) { hover = false; Invalidate(); base.OnMouseLeave(e); }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            // 先铺一层和输入框一样的内底色，圆之外不能露出别的颜色
+            using (var bg = new SolidBrush(Surface)) e.Graphics.FillRectangle(bg, ClientRectangle);
+
+            var circle = new Rectangle(0, 0, Width - 1, Height - 1);
+            Color fill = hover ? Color.FromArgb(56, 62, 80) : Color.FromArgb(32, 38, 52);
+            using (var b = new SolidBrush(fill)) e.Graphics.FillEllipse(b, circle);
+
+            int inset = Math.Max(App.S(5), Width / 3);
+            using (var pen = new Pen(hover ? App.Text : App.Muted, Math.Max(1.4f, App.Scale * 1.6f)))
+            {
+                pen.StartCap = LineCap.Round;
+                pen.EndCap = LineCap.Round;
+                e.Graphics.DrawLine(pen, inset, inset, Width - 1 - inset, Height - 1 - inset);
+                e.Graphics.DrawLine(pen, Width - 1 - inset, inset, inset, Height - 1 - inset);
+            }
+        }
+    }
+
     internal class RoundInput : Panel
     {
         public readonly TextBox Box;
         public Color Surface = App.Bg;
         private bool focused;
+        private readonly ClearDot clear;
 
         public RoundInput()
         {
@@ -367,13 +774,37 @@ namespace GitHubDownloader
             Box.GotFocus += delegate { focused = true; Invalidate(); };
             Box.LostFocus += delegate { focused = false; Invalidate(); };
             Controls.Add(Box);
+
+            clear = new ClearDot();
+            clear.Surface = Box.BackColor;
+            clear.Visible = false;                 // 空输入框不显示
+            clear.Click += delegate
+            {
+                Box.Text = "";
+                Box.Focus();
+            };
+            Controls.Add(clear);
+
+            Box.TextChanged += delegate { SyncClearButton(); };
+            Click += delegate { Box.Focus(); };    // 点输入框空白处也能聚焦
             Resize += delegate { LayoutBox(); };
+        }
+
+        private void SyncClearButton()
+        {
+            bool show = Box.TextLength > 0;
+            if (clear.Visible != show) clear.Visible = show;
         }
 
         private void LayoutBox()
         {
             int pad = App.S(14);
-            Box.SetBounds(pad, Math.Max(0, (Height - Box.PreferredHeight) / 2), Width - pad * 2, Box.PreferredHeight);
+            int dot = App.S(20);
+            // 恒定留出右侧空间：清除按钮显示/隐藏时文字不会来回跳
+            int rightReserve = dot + App.S(10);
+            int boxWidth = Math.Max(App.S(40), Width - pad - rightReserve);
+            Box.SetBounds(pad, Math.Max(0, (Height - Box.PreferredHeight) / 2), boxWidth, Box.PreferredHeight);
+            clear.SetBounds(Width - pad + App.S(4) - dot, (Height - dot) / 2, dot, dot);
         }
 
         protected override void OnPaint(PaintEventArgs e)
@@ -395,6 +826,7 @@ namespace GitHubDownloader
         public string MetaText = "";
         public bool Recommended;
         public bool Selected;
+        public bool Checked;
         public string Url = "";
         public bool Hover;
         private readonly Font titleFont;
@@ -446,10 +878,41 @@ namespace GitHubDownloader
             }
 
             int pad = App.S(14);
-            var titleRect = new Rectangle(pad, App.S(7), Width - App.S(160), App.S(20));
+
+            // 勾选框：多选批量下载用
+            int box = App.S(16);
+            var checkRect = new Rectangle(pad, (Height - box) / 2, box, box);
+            if (Checked)
+            {
+                using (var path = App.Round(checkRect, App.S(4)))
+                using (var b = new SolidBrush(App.Accent))
+                    e.Graphics.FillPath(b, path);
+                using (var pen = new Pen(Color.White, Math.Max(1.5f, App.S(2))))
+                {
+                    pen.StartCap = LineCap.Round;
+                    pen.EndCap = LineCap.Round;
+                    e.Graphics.DrawLines(pen, new Point[]
+                    {
+                        new Point(checkRect.Left + box / 5, checkRect.Top + box / 2),
+                        new Point(checkRect.Left + box * 2 / 5, checkRect.Top + box * 7 / 10),
+                        new Point(checkRect.Right - box / 5, checkRect.Top + box / 3)
+                    });
+                }
+            }
+            else
+            {
+                using (var path = App.Round(checkRect, App.S(4)))
+                using (var pen = new Pen(Hover ? App.Muted : App.Line))
+                    e.Graphics.DrawPath(pen, path);
+            }
+
+            int left = pad + box + App.S(10);
+            // 右侧给「推荐」徽标留位；窗口很窄时不能算成负数（TextRenderer 会炸）
+            int textWidth = Math.Max(App.S(40), Width - left - App.S(160));
+            var titleRect = new Rectangle(left, App.S(7), textWidth, App.S(20));
             TextRenderer.DrawText(e.Graphics, TitleText, titleFont, titleRect, App.Text,
                 TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding);
-            var metaRect = new Rectangle(pad, App.S(27), Width - App.S(160), App.S(18));
+            var metaRect = new Rectangle(left, App.S(27), textWidth, App.S(18));
             TextRenderer.DrawText(e.Graphics, MetaText, metaFont, metaRect, App.Muted,
                 TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding);
 
@@ -469,6 +932,9 @@ namespace GitHubDownloader
     {
         private readonly System.Windows.Forms.Timer timer;
         private float offset;
+        private long done;
+        private long total;
+        private long speed;
 
         public ThinProgress()
         {
@@ -489,11 +955,36 @@ namespace GitHubDownloader
             };
         }
 
+        /// <summary>总字节数；0 表示还不知道，退回不确定式跑马灯。</summary>
+        public void SetProgress(long doneBytes, long totalBytes, long speedBytes)
+        {
+            done = doneBytes;
+            total = totalBytes;
+            speed = speedBytes;
+            if (total > 0) timer.Stop(); else if (Visible) timer.Start();
+            Invalidate();
+        }
+
+        public long Speed { get { return speed; } }
+
         protected override void OnPaint(PaintEventArgs e)
         {
             e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
             using (var track = new SolidBrush(Color.FromArgb(26, 31, 42)))
                 e.Graphics.FillRectangle(track, 0, 0, Width, Height);
+
+            if (total > 0)
+            {
+                double pct = Math.Max(0, Math.Min(1, (double)done / total));
+                int filled = (int)Math.Round(Width * pct);
+                if (filled > 0)
+                {
+                    using (var path = App.Round(new Rectangle(0, 0, Math.Max(filled, Height), Height), Height / 2))
+                    using (var b = new SolidBrush(App.Accent))
+                        e.Graphics.FillPath(b, path);
+                }
+                return;
+            }
 
             int w = Math.Max(App.S(70), Width / 5);
             int x = (int)((Width + w) * offset) - w;
@@ -516,8 +1007,10 @@ namespace GitHubDownloader
 
         public string DownloadDir;
         public bool ReadClipboard;
+        public string Token;
         private readonly bool firstRun;
         private readonly RoundInput dirInput;
+        private readonly RoundInput tokenInput;
         private readonly CheckBox clipCheck;
 
         public SettingsDialog(bool firstRun)
@@ -529,7 +1022,7 @@ namespace GitHubDownloader
             BackColor = App.Bg;
             ForeColor = App.Text;
             Font = new Font("Microsoft YaHei UI", 9.5f);
-            ClientSize = new Size(App.S(560), App.S(312));
+            ClientSize = new Size(App.S(660), App.S(430));
             StartPosition = FormStartPosition.CenterParent;
             ShowInTaskbar = false;
             AutoScaleMode = AutoScaleMode.None;
@@ -594,8 +1087,33 @@ namespace GitHubDownloader
             clipCheck.ForeColor = App.Text;
             clipCheck.BackColor = App.Bg;
             clipCheck.FlatStyle = FlatStyle.Flat;
-            clipCheck.SetBounds(App.S(24), App.S(146), App.S(300), App.S(26));
+            clipCheck.SetBounds(App.S(24), App.S(140), App.S(300), App.S(26));
             Controls.Add(clipCheck);
+
+            var tokenLabel = new Label();
+            tokenLabel.Text = "GitHub 令牌";
+            tokenLabel.ForeColor = App.Muted;
+            tokenLabel.BackColor = App.Bg;
+            tokenLabel.SetBounds(App.S(24), App.S(184), App.S(116), App.S(24));
+            Controls.Add(tokenLabel);
+
+            tokenInput = new RoundInput();
+            tokenInput.SetBounds(App.S(144), App.S(178), ClientSize.Width - App.S(168), App.S(36));
+            tokenInput.Box.Font = new Font("Consolas", 9f);
+            tokenInput.Box.UseSystemPasswordChar = true;
+            Controls.Add(tokenInput);
+
+            var tokenHint = new Label();
+            tokenHint.Text = "可选，不填也能正常用。\n" +
+                "这是 GitHub 网站的 API 令牌，不是 AI 模型的 token。\n" +
+                "唯一作用：解析次数上限从「每小时 60 次」提到「每小时 5000 次」。\n" +
+                "生成方式：GitHub 头像 → Settings → Developer settings →\n" +
+                "Personal access tokens，勾只读即可。只存在你本机。";
+            tokenHint.ForeColor = App.Muted;
+            tokenHint.BackColor = App.Bg;
+            tokenHint.Font = new Font("Microsoft YaHei UI", 8.2f);
+            tokenHint.SetBounds(App.S(24), App.S(218), ClientSize.Width - App.S(48), App.S(100));
+            Controls.Add(tokenHint);
 
             var save = new PillButton();
             save.Primary = true;
@@ -615,6 +1133,7 @@ namespace GitHubDownloader
             {
                 dirInput.Box.Text = DownloadDir;
                 clipCheck.Checked = ReadClipboard;
+                tokenInput.Box.Text = Token;
                 dirInput.Box.Focus();
                 dirInput.Box.SelectionStart = dirInput.Box.TextLength;
             };
@@ -644,6 +1163,7 @@ namespace GitHubDownloader
             }
             DownloadDir = dir;
             ReadClipboard = clipCheck.Checked;
+            Token = tokenInput.Box.Text.Trim();
             DialogResult = DialogResult.OK;
             Close();
         }
@@ -714,28 +1234,64 @@ namespace GitHubDownloader
         private List<AssetRow> rows = new List<AssetRow>();
         private AssetRow selectedRow;
         private int resolveToken;
+        // 每项是 { 下载地址, 保存文件名 } —— 文件名必须来自 release 附件名
+        private readonly Queue<string[]> pendingTargets = new Queue<string[]>();
+        private string pendingOutDir = "";
+        private int pendingCount;
+        private int doneCount;
+        private int failedCount;
+        private DateTime lastOpenUtc = DateTime.MinValue;
+        private RoundPanel logHost;
+        private SlimScroll logScroll;
+        private System.Windows.Forms.Timer logSync;
+        private NotifyIcon tray;
+
 
         public MainForm()
         {
             scriptPath = ResolveScriptPath();
             App.LogLine("script=" + scriptPath);
-            defaultOut = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads", "GitHub");
+            defaultOut = App.GetDownloadsFolder();
 
             FormBorderStyle = FormBorderStyle.None;
             MaximizeBox = false;
-            Text = "GitHub 下载器 · v1.5";
+            Text = "GitHub 下载器 · v" + App.Version;
             BackColor = App.Bg;
             ForeColor = App.Text;
             Font = new Font("Microsoft YaHei UI", 9.5f);
-            StartPosition = FormStartPosition.CenterScreen;
             AutoScaleMode = AutoScaleMode.None;
             DoubleBuffered = true;
             AllowDrop = true;
             ClientSize = new Size(App.S(900), App.S(792));
             MinimumSize = new Size(App.S(760), App.S(660));
 
+            // 高 DPI 下 CenterScreen 会把窗口摆到屏幕外，状态栏和日志区直接看不见，自己算位置
+            StartPosition = FormStartPosition.Manual;
+            try
+            {
+                Rectangle wa = Screen.PrimaryScreen.WorkingArea;
+                int w = Math.Min(Width, wa.Width);
+                int h = Math.Min(Height, wa.Height - App.S(24));
+                if (w != Width || h != Height) Size = new Size(w, h);
+                int left = wa.Left + Math.Max(0, (wa.Width - Width) / 2);
+                int top = wa.Top + Math.Max(0, (wa.Height - Height) / 2);
+                Location = new Point(left, top);
+            }
+            catch { StartPosition = FormStartPosition.CenterScreen; }
+
 
             BuildUi();
+
+            // 窗口/任务栏图标：直接用 exe 内嵌的那份，和资源管理器里看到的一致
+            try { Icon = System.Drawing.Icon.ExtractAssociatedIcon(Application.ExecutablePath); }
+            catch { }
+            SetupTray();
+
+            if (Settings.MigratedLegacyDir)
+            {
+                Settings.Save();
+                App.LogLine("settings migrated -> " + Settings.DownloadDir);
+            }
             DragEnter += delegate(object s, DragEventArgs e)
             {
                 if (e.Data.GetDataPresent(DataFormats.Text)) e.Effect = DragDropEffects.Copy;
@@ -748,14 +1304,19 @@ namespace GitHubDownloader
 
             Shown += delegate
             {
+                ClampToWorkingArea();
+                // CenterScreen 之后系统还会再摆一次，消息循环空转一圈再钳一次
+                BeginInvoke(new Action(delegate { ClampToWorkingArea(); }));
+
                 if (!Settings.Exists && string.IsNullOrEmpty(App.StartOut))
                 {
                     using (var dialog = new SettingsDialog(true))
                     {
                         dialog.DownloadDir = Settings.DownloadDir;
                         dialog.ReadClipboard = Settings.ReadClipboard;
+                        dialog.Token = Settings.GitHubToken;
                         if (dialog.ShowDialog(this) == DialogResult.OK)
-                            ApplySettings(dialog.DownloadDir, dialog.ReadClipboard);
+                            ApplySettings(dialog.DownloadDir, dialog.ReadClipboard, dialog.Token);
                         else
                         {
                             Settings.DownloadDir = dialog.DownloadDir;
@@ -766,12 +1327,12 @@ namespace GitHubDownloader
                     }
                 }
 
-                if (App.AutoStart) { StartDownload(); return; }
-
                 string owner, repo, tag;
                 string text = urlInput.Box.Text.Trim();
                 if (text.Length > 0 && TryParseRepo(text, out owner, out repo, out tag))
                     ResolveRelease();
+                else if (App.AutoStart)
+                    StartDownload();   // 直链没法解析，直接下
             };
         }
 
@@ -824,6 +1385,16 @@ namespace GitHubDownloader
             }
             catch { }
             finally { applyingChrome = false; }
+        }
+
+        protected override void OnFormClosing(FormClosingEventArgs e)
+        {
+            try
+            {
+                if (tray != null) { tray.Visible = false; tray.Dispose(); tray = null; }
+            }
+            catch { }
+            base.OnFormClosing(e);
         }
 
         protected override void OnHandleCreated(EventArgs e)
@@ -935,12 +1506,20 @@ namespace GitHubDownloader
             headerPanel.MouseDown += OnHeaderMouseDown;
             Controls.Add(headerPanel);
 
-            var logo = new Label();
-            logo.Text = "●";
-            logo.ForeColor = App.Accent;
+            // 左上角品牌位：用嵌入的 icon.png（高分辨率，缩下来比从 ico 取 32px 清晰）
+            var logo = new PictureBox();
+            logo.SizeMode = PictureBoxSizeMode.Zoom;
             logo.BackColor = App.Bg;
-            logo.Font = new Font("Segoe UI", 17f, FontStyle.Bold);
-            logo.SetBounds(App.S(24), App.S(20), App.S(26), App.S(32));
+            logo.SetBounds(App.S(22), App.S(17), App.S(32), App.S(32));
+            try
+            {
+                var asm = System.Reflection.Assembly.GetExecutingAssembly();
+                using (var stream = asm.GetManifestResourceStream("GitHubDownloader.icon.png"))
+                {
+                    if (stream != null) logo.Image = Image.FromStream(stream);
+                }
+            }
+            catch { }
             logo.MouseDown += OnHeaderMouseDown;
             headerPanel.Controls.Add(logo);
 
@@ -949,12 +1528,12 @@ namespace GitHubDownloader
             title.Font = new Font("Microsoft YaHei UI", 14.5f, FontStyle.Bold);
             title.ForeColor = App.Text;
             title.BackColor = App.Bg;
-            title.SetBounds(App.S(54), App.S(18), App.S(360), App.S(30));
+            title.SetBounds(App.S(54), App.S(18), App.S(250), App.S(30));
             title.MouseDown += OnHeaderMouseDown;
             headerPanel.Controls.Add(title);
 
             var version = new Label();
-            version.Text = "v1.5";
+            version.Text = "v" + App.Version;
             version.Font = new Font("Consolas", 8.5f);
             version.ForeColor = App.Accent;
             version.BackColor = App.Bg;
@@ -967,7 +1546,7 @@ namespace GitHubDownloader
             subtitle.Text = "贴链接，挑附件，拉下来。";
             subtitle.ForeColor = App.Muted;
             subtitle.BackColor = App.Bg;
-            subtitle.SetBounds(App.S(56), App.S(46), App.S(360), App.S(20));
+            subtitle.SetBounds(App.S(56), App.S(46), App.S(250), App.S(20));
             subtitle.MouseDown += OnHeaderMouseDown;
             headerPanel.Controls.Add(subtitle);
 
@@ -977,7 +1556,11 @@ namespace GitHubDownloader
             envLabel.ForeColor = App.Muted;
             envLabel.BackColor = App.Bg;
             envLabel.Font = new Font("Consolas", 8.8f);
-            envLabel.SetBounds(App.S(560), App.S(26), App.S(196), App.S(28));
+            // 靠左固定，紧跟在版本号后面。
+            // 以前放在 x=560 且 Anchor 默认（Top|Left），窗口缩小时右侧的 ⚙ / – / ×
+            // 会一路左移压到它身上；挪到标题区就不会再撞。
+            envLabel.SetBounds(App.S(372), App.S(20), App.S(196), App.S(28));
+            envLabel.Anchor = AnchorStyles.Top | AnchorStyles.Left;
             envLabel.Paint += delegate(object s, PaintEventArgs e)
             {
                 e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
@@ -991,6 +1574,8 @@ namespace GitHubDownloader
                     TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
             };
             headerPanel.Controls.Add(envLabel);
+            // 置顶：Label 的背景是不透明的，若被 title/subtitle 压住会「缺一块」
+            envLabel.BringToFront();
 
             var gear = new PillButton();
             gear.Text = "⚙";
@@ -1006,7 +1591,7 @@ namespace GitHubDownloader
             close.Font = new Font("Segoe UI", 12f, FontStyle.Regular);
             close.SetBounds(ClientSize.Width - App.S(48), App.S(22), App.S(28), App.S(28));
             close.Anchor = AnchorStyles.Top | AnchorStyles.Right;
-            close.Click += delegate { Close(); };
+            close.Click += delegate { TryClose(); };
             headerPanel.Controls.Add(close);
 
             var minimize = new PillButton();
@@ -1151,7 +1736,7 @@ namespace GitHubDownloader
             logCard.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom;
             Controls.Add(logCard);
 
-            var logHost = new RoundPanel();
+            logHost = new RoundPanel();
             logHost.Fill = App.LogBg;
             logHost.Radius = 10;
             logHost.SetBounds(App.S(10), App.S(10), logCard.Width - App.S(20), logCard.Height - App.S(20));
@@ -1161,14 +1746,26 @@ namespace GitHubDownloader
             logBox = new TextBox();
             logBox.Multiline = true;
             logBox.ReadOnly = true;
-            logBox.ScrollBars = ScrollBars.Vertical;
+            // 原生滚动条在深色界面上是刺眼的白条，改用自绘的灰色细条
+            logBox.ScrollBars = ScrollBars.None;
             logBox.BackColor = App.LogBg;
             logBox.ForeColor = Color.FromArgb(196, 204, 220);
             logBox.BorderStyle = BorderStyle.None;
             logBox.Font = new Font("Consolas", 8.8f);
             logBox.SetBounds(App.S(6), App.S(6), logHost.Width - App.S(12), logHost.Height - App.S(12));
-            logBox.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom;
+            logBox.Anchor = AnchorStyles.Top | AnchorStyles.Left;
             logHost.Controls.Add(logBox);
+
+            logScroll = new SlimScroll();
+            logScroll.ScrollTo = delegate(int target) { ScrollLogTo(target); };
+            logHost.Controls.Add(logScroll);
+            logHost.Resize += delegate { LayoutLogArea(); };
+            LayoutLogArea();
+
+            logSync = new System.Windows.Forms.Timer();
+            logSync.Interval = 120;
+            logSync.Tick += delegate { SyncLogScroll(); };
+            logSync.Start();
 
             statusLabel = new Label();
             statusLabel.Text = "就绪";
@@ -1213,43 +1810,130 @@ namespace GitHubDownloader
             {
                 dialog.DownloadDir = Settings.DownloadDir;
                 dialog.ReadClipboard = Settings.ReadClipboard;
+                dialog.Token = Settings.GitHubToken;
                 if (dialog.ShowDialog(this) == DialogResult.OK)
-                    ApplySettings(dialog.DownloadDir, dialog.ReadClipboard);
+                    ApplySettings(dialog.DownloadDir, dialog.ReadClipboard, dialog.Token);
             }
         }
 
-        private void ApplySettings(string dir, bool readClipboard)
+        private void ApplySettings(string dir, bool readClipboard, string token)
         {
             Settings.DownloadDir = dir;
             Settings.ReadClipboard = readClipboard;
+            Settings.GitHubToken = token ?? "";
             Settings.Save();
             outInput.Box.Text = dir;
-            SetStatus("设置已保存。", App.Ok);
+            SetStatus(string.IsNullOrEmpty(Settings.GitHubToken)
+                ? "设置已保存（匿名访问，API 限额 60 次/小时）。"
+                : "设置已保存（已配置 Token，API 限额 5000 次/小时）。", App.Ok);
         }
 
         private void SetStatus(string text, Color color)
         {
             if (IsDisposed) return;
+            // 状态栏只有一行，长错误会撑出去被硬截断，这里主动省略
+            if (!string.IsNullOrEmpty(text) && text.Length > 110)
+                text = text.Substring(0, 110) + "…（完整信息看下面日志）";
             statusLabel.Text = text;
             statusLabel.ForeColor = color;
         }
 
-        private static void Log(string line)
+        private void UpdateDownloadState()
+        {
+            bool busy = running != null;
+            int checkedCount = 0;
+            foreach (var r in rows) if (r.Checked) checkedCount++;
+
+            downloadButton.Enabled = !busy &&
+                (checkedCount > 0 || !string.IsNullOrWhiteSpace(urlInput.Box.Text));
+            if (!busy) downloadButton.Text = "开始下载";
+        }
+
+        private static string FormatDuration(long seconds)
+        {
+            if (seconds < 0) seconds = 0;
+            if (seconds < 60) return seconds + " 秒";
+            if (seconds < 3600) return (seconds / 60) + " 分 " + (seconds % 60) + " 秒";
+            return (seconds / 3600) + " 时 " + ((seconds % 3600) / 60) + " 分";
+        }
+
+        private void UpdateProgressUi(long done, long total, long speed)
+        {
+            progress.SetProgress(done, total, speed);
+
+            var sb = new StringBuilder();
+            if (pendingCount > 1)
+                sb.Append('[').Append(Math.Min(doneCount + 1, pendingCount)).Append('/').Append(pendingCount).Append("]  ");
+            sb.Append(FormatSize(done));
+            if (total > 0)
+            {
+                sb.Append(" / ").Append(FormatSize(total));
+                sb.Append("  ").Append((done * 100.0 / total).ToString("0.0")).Append('%');
+                if (speed > 0)
+                {
+                    sb.Append("  ").Append(FormatSize(speed)).Append("/s");
+                    sb.Append("  剩余 ").Append(FormatDuration((total - done) / speed));
+                }
+            }
+            SetStatus(sb.ToString(), App.Muted);
+        }
+
+        /// <summary>
+        /// 系统托盘：窗口是无边框 popup，最小化后不容易找回来，托盘是最稳的入口。
+        /// </summary>
+        private void SetupTray()
         {
             try
             {
-                string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "GitHub下载器");
-                Directory.CreateDirectory(dir);
-                File.AppendAllText(Path.Combine(dir, "app.log"),
-                    DateTime.Now.ToString("HH:mm:ss.fff") + " " + line + Environment.NewLine,
-                    Encoding.UTF8);
+                tray = new NotifyIcon();
+                tray.Icon = Icon ?? SystemIcons.Application;
+                tray.Text = "GitHub 下载器";
+                tray.Visible = true;
+
+                var menu = new ContextMenuStrip();
+                var showItem = new ToolStripMenuItem("显示窗口");
+                showItem.Click += delegate { RestoreWindow(); };
+                var exitItem = new ToolStripMenuItem("退出");
+                exitItem.Click += delegate { TryClose(); };
+                menu.Items.Add(showItem);
+                menu.Items.Add(new ToolStripSeparator());
+                menu.Items.Add(exitItem);
+                tray.ContextMenuStrip = menu;
+                tray.DoubleClick += delegate { RestoreWindow(); };
             }
             catch { }
         }
 
-        private void UpdateDownloadState()
+        [DllImport("user32.dll")]
+        private static extern bool SetForegroundWindow(IntPtr hWnd);
+
+        private void RestoreWindow()
         {
-            downloadButton.Enabled = running == null && !string.IsNullOrWhiteSpace(urlInput.Box.Text);
+            try
+            {
+                Show();
+                if (WindowState == FormWindowState.Minimized) WindowState = FormWindowState.Normal;
+                Activate();
+                SetForegroundWindow(Handle);
+            }
+            catch { }
+        }
+
+        /// <summary>把窗口钳进当前显示器工作区（高 DPI 下 CenterScreen 会把它推出屏幕）。</summary>
+        private void ClampToWorkingArea()
+        {
+            try
+            {
+                Rectangle wa = Screen.FromControl(this).WorkingArea;
+                int w = Math.Min(Width, wa.Width - App.S(8));
+                int h = Math.Min(Height, wa.Height - App.S(8));
+                if (w != Width || h != Height) Size = new Size(w, h);
+
+                int left = Math.Max(wa.Left, Math.Min(Left, wa.Right - w));
+                int top = Math.Max(wa.Top, Math.Min(Top, wa.Bottom - h));
+                Location = new Point(left, top);
+            }
+            catch { }
         }
 
         private void ResolveRelease()
@@ -1269,78 +1953,171 @@ namespace GitHubDownloader
             assetTitle.Text = "Release 附件 · 读取中…";
             ClearAssets();
             SetStatus("正在读取 Release…", App.Muted);
+            AppendLog("读取 " + owner + "/" + repo +
+                (string.IsNullOrEmpty(tag) ? " 的最新 Release …" : " 的 Release @" + tag + " …"));
 
-            string api = "https://api.github.com/repos/" + owner + "/" + repo +
+            string apiBase = Environment.GetEnvironmentVariable("GHD_API_BASE");
+            if (string.IsNullOrEmpty(apiBase)) apiBase = "https://api.github.com";
+            string api = apiBase.TrimEnd('/') + "/repos/" + owner + "/" + repo +
                 (string.IsNullOrEmpty(tag) ? "/releases/latest" : "/releases/tags/" + tag);
             int token = ++resolveToken;
-            Log("resolve " + api);
+            App.LogLine("resolve " + api);
 
             var thread = new Thread(delegate()
             {
-                string data = null;
+                string body = null;
                 string error = null;
                 try
                 {
-                    string script =
-                        "[Console]::OutputEncoding=[Text.Encoding]::UTF8; " +
-                        "[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; " +
-                        "$ProgressPreference='SilentlyContinue'; " +
-                        "$r=Invoke-RestMethod -Uri '" + api +
-                        "' -Headers @{'User-Agent'='GitHubDownloader/2.0';'Accept'='application/vnd.github+json'} -TimeoutSec 25; " +
-                        "$t=[char]9; foreach($a in $r.assets){ $a.name + $t + $a.browser_download_url + $t + $a.size + $t + $a.download_count }";
-                    string encoded = Convert.ToBase64String(Encoding.Unicode.GetBytes(script));
-
-                    var psi = new ProcessStartInfo("powershell.exe");
-                    psi.Arguments = "-NoProfile -ExecutionPolicy Bypass -EncodedCommand " + encoded;
-                    psi.UseShellExecute = false;
-                    psi.CreateNoWindow = true;
-                    psi.RedirectStandardOutput = true;
-                    psi.RedirectStandardError = true;
-                    psi.StandardOutputEncoding = Encoding.UTF8;
-                    psi.StandardErrorEncoding = Encoding.UTF8;
-
-                    Log("GET " + api);
-                    using (var process = Process.Start(psi))
-                    {
-                        data = process.StandardOutput.ReadToEnd();
-                        string errText = process.StandardError.ReadToEnd();
-                        process.WaitForExit();
-                        if (process.ExitCode != 0)
-                        {
-                            string detail = string.IsNullOrWhiteSpace(errText) ? ("退出码 " + process.ExitCode) : errText.Trim();
-                                if (detail.Contains("403") || detail.IndexOf("rate limit", StringComparison.OrdinalIgnoreCase) >= 0)
-                                    detail = "GitHub API 限流了（每小时 60 次），等一会儿再试。";
-                            if (detail.Length > 300) detail = detail.Substring(0, 300);
-                            data = null;
-                            error = "读取失败：" + detail;
-                            Log("GET err " + detail);
-                        }
-                        else
-                        {
-                            Log("GET ok " + (data == null ? 0 : data.Length));
-                        }
-                    }
+                    body = FetchReleaseJson(api);
                 }
                 catch (Exception ex)
                 {
-                    error = "读取失败：" + ex.Message;
-                    Log("GET err " + ex.GetType().Name + " " + ex.Message);
+                    error = ex.Message;
+                    App.LogLine("resolve err " + ex.GetType().Name + " " + ex.Message);
                 }
 
                 if (IsDisposed || token != resolveToken) return;
                 try
                 {
-                    BeginInvoke(new Action<string, string>(delegate(string body, string err)
+                    BeginInvoke(new Action<string, string>(delegate(string json, string err)
                     {
                         if (token != resolveToken) return;
-                        if (err != null) { assetTitle.Text = "Release 附件 · 读取失败"; SetStatus(err, App.Err); return; }
-                        ShowAssets(body);
-                    }), data, error);
+                        if (err != null)
+                        {
+                            assetTitle.Text = "Release 附件 · 读取失败";
+                            SetStatus(err, App.Err);
+                            AppendLog("[解析失败] " + err);
+                            return;
+                        }
+                        ShowAssets(json);
+                    }), body, error);
                 }
                 catch (InvalidOperationException) { }
             });
             thread.IsBackground = true;
             thread.Start();
+        }
+
+        /// <summary>
+        /// 拿 GitHub API：直连 → 系统代理 → curl 兜底。
+        /// 最后一级是关键：.NET 的 HttpWebRequest 不支持 socks，
+        /// 而国内加速器很多只开 socks 端口（sing-box 的 10808 就是这样）。
+        /// </summary>
+        private static string FetchReleaseJson(string api)
+        {
+            var errors = new List<string>();
+
+            try { return FetchOnce(api, false); }
+            catch (Exception ex) { errors.Add("直连：" + ex.Message); }
+
+            try { return FetchOnce(api, true); }
+            catch (Exception ex) { errors.Add("系统代理：" + ex.Message); }
+
+            try { return FetchViaCurl(api); }
+            catch (Exception ex) { errors.Add("curl：" + ex.Message); }
+
+            throw new Exception(string.Join("；", errors.ToArray()));
+        }
+
+        private static string FetchViaCurl(string api)
+        {
+            string proxy = ProxyFinder.Find(false);
+            if (proxy == null || proxy.Length == 0)
+                throw new Exception("找不到可用代理。" + ProxyFinder.Diagnose());
+
+            var psi = new ProcessStartInfo("curl.exe");
+            var sb = new StringBuilder();
+            sb.Append("-s --max-time 12 -A \"GitHubDownloader/2.0\" -H \"Accept: application/vnd.github+json\"");
+            sb.Append(" --proxy \"").Append(proxy).Append("\"");
+            if (!string.IsNullOrEmpty(Settings.GitHubToken))
+                sb.Append(" -H \"Authorization: Bearer ").Append(Settings.GitHubToken.Replace("\"", "")).Append("\"");
+            sb.Append(" \"").Append(api).Append("\"");
+            psi.Arguments = sb.ToString();
+            psi.UseShellExecute = false;
+            psi.CreateNoWindow = true;
+            psi.RedirectStandardOutput = true;
+            psi.RedirectStandardError = true;
+            psi.StandardOutputEncoding = Encoding.UTF8;
+            psi.StandardErrorEncoding = Encoding.UTF8;
+
+            using (var proc = Process.Start(psi))
+            {
+                string body = proc.StandardOutput.ReadToEnd();
+                string err = proc.StandardError.ReadToEnd();
+                proc.WaitForExit(15000);
+                if (proc.ExitCode != 0)
+                {
+                    ProxyFinder.Find(true);
+                    throw new Exception("curl 退出码 " + proc.ExitCode +
+                        (string.IsNullOrWhiteSpace(err) ? "" : "：" + err.Trim()));
+                }
+                if (string.IsNullOrWhiteSpace(body)) throw new Exception("curl 没返回内容");
+                return body;
+            }
+        }
+
+        private static string FetchOnce(string api, bool useProxy)
+        {
+            var request = (HttpWebRequest)WebRequest.Create(api);
+            request.UserAgent = "GitHubDownloader/2.0";
+            request.Accept = "application/vnd.github+json";
+            // 超时压短：网络不通时最烦的就是干等，宁可快点失败
+            request.Timeout = 6000;
+            request.ReadWriteTimeout = 6000;
+            request.AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate;
+            // 本地调试地址 / 显式直连：都不走系统代理
+            if (!useProxy || api.StartsWith("http://127.0.0.1") || api.StartsWith("http://localhost"))
+                request.Proxy = null;
+            if (!string.IsNullOrEmpty(Settings.GitHubToken))
+                request.Headers["Authorization"] = "Bearer " + Settings.GitHubToken;
+
+            try
+            {
+                using (var response = (HttpWebResponse)request.GetResponse())
+                using (var reader = new StreamReader(response.GetResponseStream(), Encoding.UTF8))
+                    return reader.ReadToEnd();
+            }
+            catch (WebException we)
+            {
+                var http = we.Response as HttpWebResponse;
+                if (http == null)
+                {
+                    if (useProxy)
+                        throw new Exception("系统代理连不上（" + we.Status + NumberedProxy() + "）");
+                    throw new Exception("直连不通（" + we.Status + "，可能是网络或 hosts 挡住了 github）");
+                }
+
+                string remaining = http.Headers["X-RateLimit-Remaining"];
+                if (http.StatusCode == (HttpStatusCode)403 || http.StatusCode == (HttpStatusCode)429)
+                {
+                    if (remaining == "0")
+                        throw new Exception("GitHub API 限流了（匿名每小时 60 次）。到 ⚙ 里填一个 Token 可以提到 5000 次。");
+                    throw new Exception("GitHub 拒绝了这次请求（HTTP " + (int)http.StatusCode + "）。");
+                }
+                if (http.StatusCode == HttpStatusCode.NotFound)
+                    throw new Exception("仓库或 Release 不存在（私有仓库需要 Token）。");
+                throw new Exception("HTTP " + (int)http.StatusCode + " " + http.StatusDescription);
+            }
+        }
+
+        /// <summary>把注册表里的代理地址带进报错，用户一眼能看出是哪个代理挂了。</summary>
+        private static string NumberedProxy()
+        {
+            try
+            {
+                using (var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(
+                    @"Software\Microsoft\Windows\CurrentVersion\Internet Settings"))
+                {
+                    if (key == null) return "";
+                    object enabled = key.GetValue("ProxyEnable");
+                    object server = key.GetValue("ProxyServer");
+                    if (enabled == null || Convert.ToInt32(enabled) != 1) return "";
+                    if (server == null) return "";
+                    return "，系统代理是 " + Convert.ToString(server) + "，加速器可能没开";
+                }
+            }
+            catch { return ""; }
         }
 
         private void ClearAssets()
@@ -1351,48 +2128,57 @@ namespace GitHubDownloader
             assetPanel.Controls.Clear();
         }
 
-        private void ShowAssets(string data)
+        private void ShowAssets(string json)
         {
             ClearAssets();
             try
             {
                 var parsed = new List<AssetInfo>();
-                if (!string.IsNullOrEmpty(data))
+                if (!string.IsNullOrEmpty(json))
                 {
-                    foreach (string raw in data.Split('\n'))
+                    var ser = new JavaScriptSerializer();
+                    ser.MaxJsonLength = 8 * 1024 * 1024;
+                    var root = ser.Deserialize<Dictionary<string, object>>(json);
+                    if (root == null) throw new Exception("返回内容为空。");
+                    if (root.ContainsKey("message"))
+                        throw new Exception("GitHub API: " + Convert.ToString(root["message"]));
+
+                    // 注意：JavaScriptSerializer 把 JSON 数组解成 ArrayList，不是 object[]，
+                    // 按 object[] 转会得到 null，附件列表永远是空的。
+                    System.Collections.IEnumerable rawAssets = null;
+                    if (root.ContainsKey("assets")) rawAssets = root["assets"] as System.Collections.IEnumerable;
+                    if (rawAssets != null)
                     {
-                        string line = raw.TrimEnd('\r');
-                        if (line.Length == 0) continue;
-                        string[] parts = line.Split('\t');
-                        if (parts.Length < 4) continue;
-                        var info = new AssetInfo();
-                        info.Name = parts[0].Trim();
-                        info.Url = parts[1].Trim();
-                        long size;
-                        long.TryParse(parts[2].Trim(), out size);
-                        info.Size = size;
-                        int downloads;
-                        int.TryParse(parts[3].Trim(), out downloads);
-                        info.Downloads = downloads;
-                        if (info.Name.Length == 0 || info.Url.Length == 0) continue;
-                        info.Score = ScoreAsset(info.Name);
-                        parsed.Add(info);
+                        foreach (object item in rawAssets)
+                        {
+                            var map = item as Dictionary<string, object>;
+                            if (map == null) continue;
+                            var info = new AssetInfo();
+                            info.Name = map.ContainsKey("name") ? Convert.ToString(map["name"]) : "";
+                            info.Url = map.ContainsKey("browser_download_url") ? Convert.ToString(map["browser_download_url"]) : "";
+                            info.Size = map.ContainsKey("size") ? Convert.ToInt64(map["size"]) : 0L;
+                            info.Downloads = map.ContainsKey("download_count") ? Convert.ToInt32(map["download_count"]) : 0;
+                            if (string.IsNullOrEmpty(info.Name) || string.IsNullOrEmpty(info.Url)) continue;
+                            info.Score = ScoreAsset(info.Name);
+                            parsed.Add(info);
+                        }
                     }
                 }
 
                 if (parsed.Count == 0)
                 {
                     assetTitle.Text = "Release 附件 · 没有附件";
-                    SetStatus("这个 Release 没有附件。", App.Muted);
+                    SetStatus("这个 Release 没有附件。想拿源码就贴 owner/repo，会打包下载仓库。", App.Muted);
                     return;
                 }
 
                 parsed.Sort(delegate(AssetInfo a, AssetInfo b) { return b.Score.CompareTo(a.Score); });
-                Log("assets " + parsed.Count);
+                App.LogLine("assets " + parsed.Count);
 
                 int y = 0;
                 int best = parsed[0].Score;
                 bool marked = false;
+                int rowWidth = Math.Max(App.S(120), assetPanel.ClientSize.Width - App.S(20));
                 foreach (var info in parsed)
                 {
                     var row = new AssetRow();
@@ -1402,11 +2188,19 @@ namespace GitHubDownloader
                     bool isBest = !marked && best >= 60 && info.Score == best;
                     row.Recommended = isBest;
                     if (isBest) marked = true;
-                    row.SetBounds(0, y, assetPanel.ClientSize.Width - App.S(20), App.S(52));
-                    row.Click += delegate(object s, EventArgs e) { SelectRow((AssetRow)s); };
+                    row.SetBounds(0, y, rowWidth, App.S(52));
+                    row.Click += delegate(object s, EventArgs e)
+                    {
+                        var target = (AssetRow)s;
+                        target.Checked = !target.Checked;
+                        SelectRow(target);
+                        UpdateDownloadState();
+                    };
                     row.DoubleClick += delegate(object s, EventArgs e)
                     {
-                        SelectRow((AssetRow)s);
+                        var target = (AssetRow)s;
+                        target.Checked = true;
+                        SelectRow(target);
                         StartDownload();
                     };
                     assetPanel.Controls.Add(row);
@@ -1415,15 +2209,37 @@ namespace GitHubDownloader
                 }
 
                 assetTitle.Text = "Release 附件 · " + parsed.Count + " 个";
+
+                // 只有最高分那一个算推荐（和列表里的徽标保持一致），
+                // 不能写成「分数≥60 就标」，否则 Windows 系的两个附件都会被标上。
+                int topScore = parsed[0].Score;
+                string topName = topScore >= 60 ? parsed[0].Name : null;
+                AppendLog("发现 " + parsed.Count + " 个附件：");
+                foreach (var info in parsed)
+                    AppendLog("  · " + info.Name + "  " + FormatSize(info.Size) +
+                        "  下载 " + info.Downloads + " 次" +
+                        (topName != null && info.Name == topName ? "  [推荐]" : ""));
                 var recommended = rows.Find(delegate(AssetRow r) { return r.Recommended; });
                 SelectRow(recommended ?? rows[0]);
-                SetStatus("挑好了，推荐项已经按这台电脑标出来了。", App.Ok);
+                var pre = recommended ?? rows[0];
+                pre.Checked = true;
+                pre.Invalidate();
+                UpdateDownloadState();
+                SetStatus("已按这台电脑标出推荐项，可以勾选多个一起下。", App.Ok);
+
+                // --auto：解析出附件后立刻按推荐项开下
+                if (App.AutoStart)
+                {
+                    App.AutoStart = false;
+                    StartDownload();
+                }
             }
             catch (Exception ex)
             {
                 assetTitle.Text = "Release 附件 · 解析失败";
                 SetStatus("解析失败：" + ex.Message, App.Err);
-                Log("show err " + ex.GetType().Name + ": " + ex.Message);
+                AppendLog("[解析失败] " + ex.Message);
+                App.LogLine("show err " + ex.GetType().Name + ": " + ex.Message);
             }
         }
 
@@ -1432,7 +2248,7 @@ namespace GitHubDownloader
             if (row == null) return;
             foreach (var r in rows) { r.Selected = r == row; r.Invalidate(); }
             selectedRow = row;
-            urlInput.Box.Text = row.Url;
+            // 以前这里会把输入框改写成资产直链，导致想换个 tag 重解析时输入框已被污染。
             UpdateDownloadState();
         }
 
@@ -1501,9 +2317,7 @@ namespace GitHubDownloader
         {
             if (running != null) return;
 
-            string target = urlInput.Box.Text.Trim();
             string outDir = outInput.Box.Text.Trim().Replace("\"", "");
-            if (target.Length == 0) { SetStatus("先贴一个链接。", App.Err); return; }
             if (outDir.Length == 0) outDir = Settings.DownloadDir;
 
             if (!File.Exists(scriptPath))
@@ -1516,17 +2330,54 @@ namespace GitHubDownloader
             try { Directory.CreateDirectory(outDir); }
             catch (Exception ex) { SetStatus("创建目录失败：" + ex.Message, App.Err); return; }
 
+            // 勾选了附件就批量下，没勾就用输入框里那一条
+            var targets = new List<string[]>();
+            foreach (var r in rows)
+                if (r.Checked && !string.IsNullOrEmpty(r.Url)) targets.Add(new string[] { r.Url, r.TitleText });
+            if (targets.Count == 0)
+            {
+                string typed = urlInput.Box.Text.Trim();
+                if (typed.Length == 0) { SetStatus("先贴一个链接。", App.Err); return; }
+                targets.Add(new string[] { typed, "" });
+            }
+
+            pendingTargets.Clear();
+            foreach (string[] t in targets) pendingTargets.Enqueue(t);
+            pendingOutDir = outDir;
+            pendingCount = targets.Count;
+            doneCount = 0;
+            failedCount = 0;
+
             logBox.Clear();
-            App.LogLine("download " + target + " -> " + outDir);
-            AppendLog("目标：" + target);
+            App.LogLine("download x" + pendingCount + " -> " + outDir);
             AppendLog("保存到：" + outDir);
             AppendLog("");
+            progress.SetProgress(0, 0, 0);
+
+            RunNext();
+        }
+
+        private void RunNext()
+        {
+            if (pendingTargets.Count == 0) { FinishQueue(); return; }
+
+            string[] item = pendingTargets.Dequeue();
+            string target = item[0];
+            string fileName = item.Length > 1 ? item[1] : "";
+            SetRunning(true);
+            SetStatus("启动中…", App.Muted);
+            AppendLog("目标：" + (string.IsNullOrEmpty(fileName) ? target : fileName));
 
             try
             {
                 var psi = new ProcessStartInfo("powershell.exe");
-                psi.Arguments = "-NoProfile -ExecutionPolicy Bypass -File \"" + scriptPath + "\" -Target \"" +
-                    target.Replace("\"", "") + "\" -OutDir \"" + outDir + "\"";
+                // -Quiet 只要 ## 行；-NonInteractive 防止脚本 Read-Host 把界面挂死；-NoOpen 不弹资源管理器
+                string nameArg = string.IsNullOrEmpty(fileName)
+                    ? "" : " -Name \"" + fileName.Replace("\"", "").Trim() + "\"";
+                psi.Arguments = "-NoProfile -ExecutionPolicy Bypass -File \"" + scriptPath + "\"" +
+                    " -Target \"" + target.Replace("\"", "") + "\"" +
+                    " -OutDir \"" + pendingOutDir + "\"" + nameArg +
+                    " -Quiet -NonInteractive -NoOpen";
                 psi.UseShellExecute = false;
                 psi.CreateNoWindow = true;
                 psi.RedirectStandardOutput = true;
@@ -1538,11 +2389,11 @@ namespace GitHubDownloader
                 process.StartInfo = psi;
                 process.OutputDataReceived += delegate(object s, DataReceivedEventArgs e)
                 {
-                    if (e.Data != null) PostLog(e.Data);
+                    if (e.Data != null) PostLine(e.Data, false);
                 };
                 process.ErrorDataReceived += delegate(object s, DataReceivedEventArgs e)
                 {
-                    if (!string.IsNullOrEmpty(e.Data)) PostLog("[stderr] " + e.Data);
+                    if (!string.IsNullOrEmpty(e.Data)) PostLine(e.Data, true);
                 };
                 process.EnableRaisingEvents = true;
                 process.Exited += delegate
@@ -1553,8 +2404,6 @@ namespace GitHubDownloader
                 };
 
                 running = process;
-                SetRunning(true);
-                SetStatus("下载中……", App.Muted);
                 process.Start();
                 process.BeginOutputReadLine();
                 process.BeginErrorReadLine();
@@ -1562,9 +2411,10 @@ namespace GitHubDownloader
             catch (Exception ex)
             {
                 running = null;
-                SetRunning(false);
+                failedCount++;
                 SetStatus("启动失败：" + ex.Message, App.Err);
                 AppendLog("[错误] " + ex.Message);
+                if (pendingTargets.Count > 0) RunNext(); else FinishQueue();
             }
         }
 
@@ -1572,19 +2422,37 @@ namespace GitHubDownloader
         {
             App.LogLine("finish code=" + exitCode);
             running = null;
-            SetRunning(false);
-            if (exitCode == 0)
+            if (exitCode == 0) doneCount++; else failedCount++;
+
+            if (pendingTargets.Count > 0)
             {
-                SetStatus("完成了，去目标文件夹验收。", App.Ok);
+                AppendLog("");
+                RunNext();
+                return;
+            }
+            FinishQueue();
+        }
+
+        private void FinishQueue()
+        {
+            SetRunning(false);
+            progress.SetProgress(0, 0, 0);
+
+            if (failedCount == 0)
+            {
+                SetStatus(pendingCount > 1
+                    ? ("全部完成：" + doneCount + " 个文件，去目标文件夹验收。")
+                    : "完成了，去目标文件夹验收。", App.Ok);
                 AppendLog("");
                 AppendLog("=== 完成 ===");
             }
             else
             {
-                SetStatus("结束了，退出码 " + exitCode + "，看日志。", App.Err);
+                SetStatus("完成 " + doneCount + " 个，失败 " + failedCount + " 个，看日志。", App.Err);
                 AppendLog("");
-                AppendLog("=== 退出码 " + exitCode + " ===");
+                AppendLog("=== 完成 " + doneCount + " 个，失败 " + failedCount + " 个 ===");
             }
+
             if (App.AutoExit)
             {
                 System.Windows.Forms.Timer closer = new System.Windows.Forms.Timer();
@@ -1594,10 +2462,25 @@ namespace GitHubDownloader
             }
         }
 
+        /// <summary>正在下载时退出会中断，先问一句。</summary>
+        private void TryClose()
+        {
+            if (running != null)
+            {
+                var answer = MessageBox.Show(this,
+                    "正在下载，退出会中断当前文件。确定要退出吗？",
+                    "GitHub 下载器", MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
+                if (answer != DialogResult.Yes) return;
+                CancelDownload();
+            }
+            Close();
+        }
+
         private void CancelDownload()
         {
             Process process = running;
-            if (process == null) return;
+            pendingTargets.Clear();
+            if (process == null) { SetRunning(false); return; }
             try
             {
                 if (!process.HasExited)
@@ -1613,14 +2496,38 @@ namespace GitHubDownloader
 
         private void OpenOutput()
         {
-            string dir = outInput.Box.Text.Trim();
+            string dir = outInput.Box.Text.Trim().Trim('"');
             if (dir.Length == 0) dir = defaultOut;
+            if (dir.Length > 3) dir = dir.TrimEnd('\\', '/');
             try
             {
-                if (Directory.Exists(dir)) Process.Start("explorer.exe", "\"" + dir + "\"");
-                else SetStatus("这个目录还不存在：" + dir, App.Err);
+                // 防手抖：800ms 内的重复触发只算一次
+                if ((DateTime.UtcNow - lastOpenUtc).TotalMilliseconds < 800)
+                {
+                    App.LogLine("open skipped (debounce)");
+                    return;
+                }
+                lastOpenUtc = DateTime.UtcNow;
+
+                if (!Directory.Exists(dir))
+                {
+                    SetStatus("这个目录还不存在：" + dir, App.Err);
+                    return;
+                }
+
+                App.LogLine("open " + dir);
+                // 不要用 Process.Start("explorer.exe", "\"路径\"")：
+                // 那是「启动 explorer 进程」+「让它导航」，某些系统上会开出两个窗口。
+                var psi = new ProcessStartInfo(dir);
+                psi.UseShellExecute = true;
+                psi.Verb = "open";
+                Process.Start(psi);
             }
-            catch (Exception ex) { SetStatus("打不开：" + ex.Message, App.Err); }
+            catch (Exception ex)
+            {
+                App.LogLine("open err " + ex.Message);
+                SetStatus("打不开：" + ex.Message, App.Err);
+            }
         }
 
         private void SetRunning(bool busy)
@@ -1636,17 +2543,84 @@ namespace GitHubDownloader
             UpdateDownloadState();
         }
 
-        private void PostLog(string line)
+        private void PostLine(string line, bool isError)
         {
             if (IsDisposed) return;
-            try { BeginInvoke(new Action<string>(AppendLog), line); }
+            try { BeginInvoke(new Action<string, bool>(OnScriptLine), line, isError); }
             catch (InvalidOperationException) { }
+        }
+
+        private void OnScriptLine(string line, bool isError)
+        {
+            if (IsDisposed) return;
+
+            // 脚本 -> 界面的机器可读协议
+            if (line.StartsWith("##PROGRESS "))
+            {
+                string[] parts = line.Split(new char[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+                long done, total, speed;
+                if (parts.Length >= 4 &&
+                    long.TryParse(parts[1], out done) &&
+                    long.TryParse(parts[2], out total) &&
+                    long.TryParse(parts[3], out speed))
+                {
+                    UpdateProgressUi(done, total, speed);
+                }
+                return;
+            }
+            if (line.StartsWith("##DONE "))
+            {
+                AppendLog("[完成] " + line.Substring(7));
+                return;
+            }
+            if (line.StartsWith("##FAIL "))
+            {
+                AppendLog("[失败] " + line.Substring(7));
+                return;
+            }
+
+            AppendLog(isError ? ("[stderr] " + line) : line);
+        }
+
+        /// <summary>日志框和自绘滚动条的位置分配（右侧留出一条给滚动条）。</summary>
+        private void LayoutLogArea()
+        {
+            if (logHost == null || logBox == null || logScroll == null) return;
+            int pad = App.S(6);
+            int sw = App.S(8);
+            int gap = App.S(4);
+            int boxW = Math.Max(App.S(40), logHost.Width - pad * 2 - sw - gap);
+            int boxH = Math.Max(App.S(20), logHost.Height - pad * 2);
+            logBox.SetBounds(pad, pad, boxW, boxH);
+            logScroll.SetBounds(logHost.Width - pad - sw, pad, sw, boxH);
+        }
+
+        private void SyncLogScroll()
+        {
+            if (logBox == null || logBox.IsDisposed || !logBox.IsHandleCreated || logScroll == null) return;
+            int total = (int)SendMessage(logBox.Handle, 0x00BA, IntPtr.Zero, IntPtr.Zero);   // EM_GETLINECOUNT
+            int first = (int)SendMessage(logBox.Handle, 0x00CE, IntPtr.Zero, IntPtr.Zero);   // EM_GETFIRSTVISIBLELINE
+            int lineHeight = Math.Max(App.S(10), logBox.Font.Height);
+            int visible = Math.Max(1, logBox.ClientSize.Height / lineHeight);
+            logScroll.Sync(total, first, visible);
+
+        }
+
+        private void ScrollLogTo(int targetLine)
+        {
+            if (logBox == null || !logBox.IsHandleCreated) return;
+            int current = (int)SendMessage(logBox.Handle, 0x00CE, IntPtr.Zero, IntPtr.Zero);
+            SendMessage(logBox.Handle, 0x00B6, IntPtr.Zero, (IntPtr)(targetLine - current));  // EM_LINESCROLL
         }
 
         private void AppendLog(string line)
         {
             if (logBox.IsDisposed) return;
             logBox.AppendText(line + Environment.NewLine);
+            // 追加之后必须把插入点移到末尾并滚过去，否则视图停在最上面那几行，
+            // 用户会以为日志只有一条。
+            logBox.SelectionStart = logBox.TextLength;
+            logBox.ScrollToCaret();
         }
     }
 }

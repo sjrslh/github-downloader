@@ -1,7 +1,7 @@
 from PIL import Image, ImageDraw, ImageFilter
 import os
 
-root = r"C:\Users\sjrzh\Documents\GitHub下载器"
+root = os.path.dirname(os.path.abspath(__file__))
 assets = os.path.join(root, "assets")
 src = os.path.join(assets, "icon-src.webp")
 

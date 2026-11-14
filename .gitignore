@@ -12,3 +12,10 @@ legacy/
 obj/
 bin/
 __pycache__/
+
+# 临时截图 / 源码备份，别提交
+_*.png
+_*.ps1
+src/*.b[0-9]*
+# CI 需要带 workflow scope 的凭据才能推送，先留本地
+.github/workflows/

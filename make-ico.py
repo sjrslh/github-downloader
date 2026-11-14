@@ -1,7 +1,7 @@
 from PIL import Image
 import struct, io, os
 
-root = r"C:\Users\sjrzh\Documents\GitHub下载器"
+root = os.path.dirname(os.path.abspath(__file__))
 assets = os.path.join(root, "assets")
 img = Image.open(os.path.join(assets, "icon.png")).convert("RGBA")
 
