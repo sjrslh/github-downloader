@@ -43,7 +43,7 @@ namespace GitHubDownloader
         public static readonly Color CloseHover = Color.FromArgb(232, 17, 35);
 
         /// <summary>版本号只在这里改，标题和界面都引用它。</summary>
-        public static readonly string Version = "1.6";
+        public static readonly string Version = "1.6.1";
 
         public static float Scale = 1f;
         public static string StartUrl;
@@ -314,6 +314,12 @@ namespace GitHubDownloader
             }
             catch { }
         }
+    }
+
+    /// <summary>Release 接口 404 —— 可能仓库不存在，也可能只是没发过 Release。</summary>
+    internal sealed class ReleaseNotFoundException : Exception
+    {
+        public ReleaseNotFoundException() : base("Release 不存在") { }
     }
 
     /// <summary>
@@ -1974,7 +1980,33 @@ namespace GitHubDownloader
                 catch (Exception ex)
                 {
                     error = ex.Message;
-                    App.LogLine("resolve err " + ex.GetType().Name + " " + ex.Message);
+                    if (ex is ReleaseNotFoundException)
+                    {
+                        var probe = ProbeMissingRelease(owner, repo);
+                        App.LogLine("resolve 404 -> " + probe.Message);
+
+                        // 仓库在、但一个 Release 都没有：直接改成打包下载源码，而不是报错
+                        if (probe.NoRelease)
+                        {
+                            if (IsDisposed || token != resolveToken) return;
+                            try
+                            {
+                                BeginInvoke(new Action<string, string>(delegate(string o, string r)
+                                {
+                                    if (token != resolveToken) return;
+                                    FallbackToSource(owner, repo);
+                                }), owner, repo);
+                            }
+                            catch (InvalidOperationException) { }
+                            return;
+                        }
+
+                        error = probe.Message;
+                    }
+                    else
+                    {
+                        App.LogLine("resolve err " + ex.GetType().Name + " " + ex.Message);
+                    }
                 }
 
                 if (IsDisposed || token != resolveToken) return;
@@ -2007,15 +2039,23 @@ namespace GitHubDownloader
         private static string FetchReleaseJson(string api)
         {
             var errors = new List<string>();
+            bool saw404 = false;
 
             try { return FetchOnce(api, false); }
+            catch (ReleaseNotFoundException) { saw404 = true; errors.Add("直连：404"); }
             catch (Exception ex) { errors.Add("直连：" + ex.Message); }
 
             try { return FetchOnce(api, true); }
+            catch (ReleaseNotFoundException) { saw404 = true; errors.Add("系统代理：404"); }
             catch (Exception ex) { errors.Add("系统代理：" + ex.Message); }
 
             try { return FetchViaCurl(api); }
+            catch (ReleaseNotFoundException) { saw404 = true; errors.Add("curl：404"); }
             catch (Exception ex) { errors.Add("curl：" + ex.Message); }
+
+            // 只要有一级明确拿到 404，就说明服务器可达且资源不存在，
+            // 把类型信息传上去，让上层能区分「没发 Release」和「仓库不存在」。
+            if (saw404) throw new ReleaseNotFoundException();
 
             throw new Exception(string.Join("；", errors.ToArray()));
         }
@@ -2028,7 +2068,7 @@ namespace GitHubDownloader
 
             var psi = new ProcessStartInfo("curl.exe");
             var sb = new StringBuilder();
-            sb.Append("-s --max-time 12 -A \"GitHubDownloader/2.0\" -H \"Accept: application/vnd.github+json\"");
+            sb.Append("-s --max-time 12 -w \"\\n%{http_code}\" -A \"GitHubDownloader/2.0\" -H \"Accept: application/vnd.github+json\"");
             sb.Append(" --proxy \"").Append(proxy).Append("\"");
             if (!string.IsNullOrEmpty(Settings.GitHubToken))
                 sb.Append(" -H \"Authorization: Bearer ").Append(Settings.GitHubToken.Replace("\"", "")).Append("\"");
@@ -2052,9 +2092,79 @@ namespace GitHubDownloader
                     throw new Exception("curl 退出码 " + proc.ExitCode +
                         (string.IsNullOrWhiteSpace(err) ? "" : "：" + err.Trim()));
                 }
+
+                // -w 把状态码附在 body 末尾：{json}\n200
+                // 不拆出来的话，404 的错误 JSON 会被当成正常内容交给上层，
+                // 最后显示成没头没脑的「GitHub API: Not Found」。
+                int nl = body.LastIndexOf('\n');
+                if (nl > 0)
+                {
+                    string codeText = body.Substring(nl + 1).Trim();
+                    string realBody = body.Substring(0, nl);
+                    int code;
+                    if (int.TryParse(codeText, out code) && code != 200)
+                    {
+                        if (code == 404) throw new ReleaseNotFoundException();
+                        if (code == 403 || code == 429)
+                            throw new Exception("GitHub 限流或拒绝（HTTP " + code +
+                                "）。到 ⚙ 里填 GitHub 令牌可提到 5000 次/小时。");
+                        throw new Exception("HTTP " + code);
+                    }
+                    body = realBody;
+                }
+
                 if (string.IsNullOrWhiteSpace(body)) throw new Exception("curl 没返回内容");
                 return body;
             }
+        }
+
+        /// <summary>404 之后的分诊结果。</summary>
+        private sealed class ReleaseProbe
+        {
+            public bool RepoExists;      // 仓库是否存在
+            public bool NoRelease;       // 存在，但一个 Release 都没有
+            public string Message;       // 面向用户的话
+        }
+
+        /// <summary>
+        /// /releases/latest 返回 404 时，再拉一次 /releases 列表来分辨原因：
+        /// 空数组 = 仓库在、但没发过 Release（可以改成打包下源码）；也 404 = 仓库本身不存在。
+        /// </summary>
+        private static ReleaseProbe ProbeMissingRelease(string owner, string repo)
+        {
+            var probe = new ReleaseProbe();
+            string apiBase = Environment.GetEnvironmentVariable("GHD_API_BASE");
+            if (string.IsNullOrEmpty(apiBase)) apiBase = "https://api.github.com";
+            string listApi = apiBase.TrimEnd('/') + "/repos/" + owner + "/" + repo + "/releases";
+
+            try
+            {
+                string body;
+                try { body = FetchOnce(listApi, false); }
+                catch (Exception) { body = FetchViaCurl(listApi); }
+                string trimmed = (body ?? "").Trim();
+
+                probe.RepoExists = true;
+                if (trimmed == "[]")
+                {
+                    probe.NoRelease = true;
+                    probe.Message = "这个仓库没有 Release，已改为打包下载整个仓库的源码。";
+                }
+                else
+                {
+                    probe.Message = "这个仓库的 Release 都是草稿，没有可下载的正式版本。";
+                }
+            }
+            catch (ReleaseNotFoundException)
+            {
+                probe.Message = "仓库不存在：GitHub 上找不到 " + owner + "/" + repo +
+                    "。检查拼写；私有仓库需要先在 ⚙ 里填 GitHub 令牌。";
+            }
+            catch (Exception ex)
+            {
+                probe.Message = "读取失败：" + ex.Message;
+            }
+            return probe;
         }
 
         private static string FetchOnce(string api, bool useProxy)
@@ -2096,7 +2206,7 @@ namespace GitHubDownloader
                     throw new Exception("GitHub 拒绝了这次请求（HTTP " + (int)http.StatusCode + "）。");
                 }
                 if (http.StatusCode == HttpStatusCode.NotFound)
-                    throw new Exception("仓库或 Release 不存在（私有仓库需要 Token）。");
+                    throw new ReleaseNotFoundException();
                 throw new Exception("HTTP " + (int)http.StatusCode + " " + http.StatusDescription);
             }
         }
@@ -2118,6 +2228,25 @@ namespace GitHubDownloader
                 }
             }
             catch { return ""; }
+        }
+
+        /// <summary>
+        /// 仓库没有 Release 时，自动切到「打包下载整个仓库」。
+        /// 硬件图纸、文档、模板这类项目本来就不发 Release，不该因此下不了。
+        /// </summary>
+        private void FallbackToSource(string owner, string repo)
+        {
+            if (IsDisposed) return;
+
+            string repoUrl = "https://github.com/" + owner + "/" + repo;
+            urlInput.Box.Text = repoUrl;
+            assetTitle.Text = "无 Release · 改为下载源码包";
+
+            AppendLog("[提示] " + owner + "/" + repo + " 没有发布 Release，改为打包下载整个仓库。");
+            SetStatus("这个仓库没有 Release，正在打包下载源码 …", App.Muted);
+            UpdateDownloadState();
+
+            StartDownload();
         }
 
         private void ClearAssets()

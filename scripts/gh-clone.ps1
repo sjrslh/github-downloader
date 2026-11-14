@@ -71,7 +71,19 @@ if (-not $zipPath) { throw '没有找到下载下来的 zip。' }
 
 $stage = Join-Path $OutDir (".stage-" + $info.Name)
 if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
-Expand-Archive -Path $zipPath -DestinationPath $stage -Force
+
+# Expand-Archive 在 PowerShell 5.1 上对稍大的 zip 容易静默失败（目录建了但不解文件），
+# 换成 .NET 的 ZipFile，并把真实错误抛出来。
+try {
+    Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
+    [System.IO.Compression.ZipFile]::ExtractToDirectory($zipPath, $stage)
+} catch {
+    $msg = $_.Exception.Message
+    if ($_.Exception.InnerException) { $msg = $_.Exception.InnerException.Message }
+    [Console]::Out.WriteLine(('##FAIL 解包失败 ' + $msg))
+    Write-Host ('解包失败：' + $msg) -ForegroundColor Red
+    throw ('解包失败：' + $msg)
+}
 
 # codeload 的 zip 顶层会多一层 <repo>-<sha> 目录，剥掉后落到干净的 <OutDir>\<repo>
 $final = Join-Path $OutDir $info.Name
