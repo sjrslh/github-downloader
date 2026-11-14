@@ -1,4 +1,3 @@
-# verified: credential chain fixed
 name: build
 
 on:
@@ -7,6 +6,9 @@ on:
     tags: ['v*']
   pull_request:
   workflow_dispatch:
+
+permissions:
+  contents: write   # action-gh-release 需要写权限，默认是只读
 
 jobs:
   build:
