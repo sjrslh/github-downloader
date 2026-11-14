@@ -17,8 +17,6 @@ __pycache__/
 _*.png
 _*.ps1
 src/*.b[0-9]*
-# CI 需要带 workflow scope 的凭据才能推送，先留本地
-.github/workflows/
 # 截图工具（本地用）
 _*.cs
 _*.dll
